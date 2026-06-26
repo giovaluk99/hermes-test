@@ -183,6 +183,34 @@ than booting a real VM per tenant. For an "always-on computer per end user"
 that's the right trade — it just means the instance is a place to run *agents and
 apps*, not a place to run *kernels, VMs, or privileged infra*.
 
+## 7. Logs & observability
+
+There is **no logs endpoint** on either plane. `dmesg`/journald don't apply
+(PID 1 is `entrypoint.sh`, not an init system), and process stdout goes to the
+*host's* container log (`/proc/1/fd/1 -> host:[2]`) which you can't read from
+inside. You assemble log pulling from three exposed sources:
+
+| Want | Source | How |
+|------|--------|-----|
+| Runtime / system logs | files in `~/.hermes/logs/` (`agent.log`, `errors.log`, `gateway.log`, `gui.log`, `gateway-exit-diag.log`) | `GET {id}.agent37.app/v1/files/content?path=...` (no 512 KB cap) |
+| Quick tail / grep | same files | `exec 'tail -n 200 ~/.hermes/logs/agent.log'` (512 KB cap) |
+| Discover what log files exist | the instance | `exec 'find ~/.hermes/logs -type f'` |
+| Agent conversation logs | the gateway | `GET {id}.agent37.app/v1/sessions`, then `/v1/responses/{id}` |
+| Live agent activity (reasoning/tools/output) | a running turn | `stream: true` on `/v1/responses`, or replay+attach via `/v1/responses/{id}/stream` |
+
+(OpenClaw instances keep logs under a different dir — set `AGENT37_LOG_SRC`.)
+
+**Setup:** [`pull-logs.sh`](../pull-logs.sh) mirrors every instance in the
+workspace into `logs/<id>/` — it lists instances on the hosting API, `find`s the
+log files via `exec`, pulls each uncapped via the Files endpoint, and grabs
+`/v1/sessions`. Run it from cron/launchd for continuous pulling (each run
+overwrites with the instance's current full file = always-latest mirror).
+Verified live: pulled 5 log files + sessions from `ym8dpjcfhi` in one run.
+
+For large/growing logs, switch the whole-file pull to an incremental byte-offset
+tail (`exec 'tail -c +$N file'`, track `$N` locally). For a real pipeline, point
+the pull at your log store (Loki/CloudWatch/S3) instead of local files.
+
 ---
 
 ### Reproduce

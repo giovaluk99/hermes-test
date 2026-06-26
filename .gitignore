@@ -1,1 +1,4 @@
 .DS_Store
+
+# pulled instance logs (runtime artifacts, may contain secrets)
+logs/

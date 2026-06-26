@@ -20,3 +20,18 @@ export AGENT37_INSTANCE=ym8dpjcfhi
 
 See [docs/under-the-hood.md](docs/under-the-hood.md) for how the instance runs
 (two-plane API, process tree, the gVisor sandbox, persistence, and gVisor-vs-VM limits).
+
+## Pulling instance logs
+
+`./pull-logs.sh` mirrors every instance's logs into `logs/<id>/` (git-ignored).
+
+```bash
+export AGENT37_KEY=sk_live_...        # or rely on AGENT37_GIO_TEST
+./pull-logs.sh                        # one-shot pull of the whole workspace
+# continuous: cron every 5 min
+*/5 * * * * cd /path/to/hermes-test && AGENT37_KEY=sk_live_... ./pull-logs.sh >> logs/pull.cron.log 2>&1
+```
+
+Sources stitched (there's no logs endpoint): runtime log files via the Files
+endpoint, file discovery via `exec`, conversation history via `/v1/sessions`.
+See [docs/under-the-hood.md](docs/under-the-hood.md#7-logs--observability).
