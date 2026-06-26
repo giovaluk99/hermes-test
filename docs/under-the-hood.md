@@ -101,6 +101,44 @@ These are the `resources` you set on create; resizing re-debits at the new size.
 Network egress is open (`curl https://ifconfig.me` → 200), but there's **no raw
 socket** (`ping`/ICMP unavailable) — gVisor only exposes TCP/UDP via its netstack.
 
+## 5b. Headful browsers & residential proxies
+
+**Headful browsers: yes.** `chromium` is at `/usr/bin/chromium`, plus a Playwright
+build at `/opt/ms-playwright/chromium-1228/`. The entrypoint runs `Xvfb :99` +
+`openbox`, so a real browser with full UI renders to the virtual framebuffer
+(viewable via the live desktop / ttyd on :7681). Launching `chromium` **without**
+`--headless` against `DISPLAY=:99` produced a real window (tab strip, address bar,
+the `--no-sandbox` infobar) — see [img/headful-chromium.png](img/headful-chromium.png).
+
+```bash
+./a37 'export DISPLAY=:99; chromium --no-sandbox --window-size=1280,800 https://example.com & \
+       sleep 6; import -window root /tmp/shot.png'   # imagemagick is preinstalled
+```
+
+Notes: pass `--no-sandbox` (Chrome's own sandbox can't nest inside gVisor as uid
+1000); the `dbus`/GCM errors in the log are harmless. The exec shell has an empty
+`DISPLAY`, so set `DISPLAY=:99` yourself.
+
+**Residential IP proxy — the instance is NOT residential.** Egress is a datacenter
+IP: `15.204.212.224`, **AS16276 OVH SAS** (Virginia). You can't make the instance
+itself a residential exit. Two things follow:
+
+- **Route through a 3rd-party residential proxy: works.** Both paths verified:
+  - Per-app HTTP(S): `HTTPS_PROXY=http://user:pass@gw.provider:port` (curl/Node/
+    Python honor it). A test against a bogus proxy made curl time out *on the
+    proxy* instead of going direct — proof traffic is routed through it.
+  - Chromium: `--proxy-server="http://user:pass@gw.provider:port"` (or SOCKS5).
+    Accepted and launches. Use a provider like Bright Data / Oxylabs / IPRoyal /
+    Smartproxy; supply your own creds (these go straight out, never touch the
+    managed meter).
+  - For apps that ignore proxy env, `proxychains` (LD_PRELOAD, **no privileges
+    needed**) can wrap them — not preinstalled, but installable via the bundled
+    linuxbrew or pip/npm into `/home/node`.
+- **System-wide VPN/tun: no.** `/dev/net/tun` exists, but `CapEff` is empty (no
+  `CAP_NET_ADMIN`), so you can't bring up a `tun` device — OpenVPN/WireGuard at
+  the OS level won't work. Per-app proxying is the supported pattern. (This is
+  the same capability limit covered below.)
+
 ## 6. gVisor limitations vs a true VM
 
 What you give up by being in a gVisor sandbox instead of a full VM:
