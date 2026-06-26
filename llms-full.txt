@@ -1,0 +1,2921 @@
+# Billing
+Source: https://agent37.com/docs/agents-api/billing
+
+Prepaid and managed in the dashboard: one workspace wallet funds compute and managed usage.
+
+Billing is prepaid. You top up one workspace wallet in the dashboard, and everything draws from it: instance compute and managed usage.
+
+## How the balance works
+
+* **\$1 free to start.** Your first visit to the dashboard grants a one-time \$1 credit, enough to run your first instance for days. Until your first real top-up, the workspace runs one instance of any template, up to the 2 vCPU / 4 GB shape; a larger shape returns `403 tier_limit`. Your first top-up unlocks the 4/8 and 8/16 shapes, and up to 10 instances.
+* **Top up in the dashboard.** Add funds at [dashboard/cloud/billing](https://www.agent37.com/dashboard/cloud/billing). Top-ups are \$5 to \$1000 each, paid through Stripe.
+* **Or top up automatically.** Set a rule once and the wallet refills itself; see [Automatic top-up](#automatic-top-up).
+* **Instances draw it down.** Compute bills hourly, prepaid one day at a time, for as long as the instance exists, stopped or running.
+* **Managed usage draws it down.** Managed LLM, Brave search, and Composio calls are metered at cost against the same wallet, gated by each instance's [budget](/docs/agents-api/budgets).
+* **Delete to stop billing.** Deleting an instance refunds the unused remainder of its prepaid day, prorated to the hour.
+
+<Note>
+  There are no balance or billing endpoints on `/v1`. The wallet, top-ups, and the ledger are managed entirely in the [dashboard](https://www.agent37.com/dashboard/cloud/billing).
+</Note>
+
+## Compute pricing
+
+Compute is priced from the instance's `resources`:
+
+| Resource | Rate                      |
+| -------- | ------------------------- |
+| vCPU     | \$0.80 per vCPU per month |
+| RAM      | \$0.70 per GB per month   |
+| Disk     | \$0.09 per GB per month   |
+
+Applied to the shapes at their default disk:
+
+| Shape                                                             | Price at the default disk |
+| ----------------------------------------------------------------- | ------------------------- |
+| 1 vCPU / 3 GB RAM / 6-20 GB disk (`agent37-hermes-small` only)    | \$3.44                    |
+| 2 vCPU / 4 GB RAM / 6-20 GB disk (default for standard templates) | \$4.94                    |
+| 4 vCPU / 8 GB RAM / 20-40 GB disk                                 | \$10.60                   |
+| 8 vCPU / 16 GB RAM / 40-80 GB disk                                | \$21.20                   |
+
+Disk is any whole number of GB within the shape's range and defaults to the range minimum; disk above the minimum adds \$0.09 per GB per month. See [Instances](/docs/agents-api/instances) for how to pick a shape with `resources` on create.
+
+## The daily cycle
+
+The monthly price is the rate; the wallet is debited one day at a time (the hourly rate, monthly / 730, times 24).
+
+**Create debits the first day.** `POST /v1/instances` charges one day of compute up front. The debit is the create gate: if the wallet cannot cover it, the create returns `402 insufficient_balance` and nothing is provisioned.
+
+```json theme={null}
+{
+  "error": {
+    "code": "insufficient_balance",
+    "message": "This instance costs $0.0068 per hour, billed one day in advance ($0.1624). Add balance to your workspace and try again."
+  }
+}
+```
+
+If provisioning fails after the debit, for example a custom template's image cannot be pulled, the day is refunded in full.
+
+**More instances need more balance.** From your second concurrent instance on, your balance must hold 30 days of compute for the whole fleet, the new instance included: two small instances need about \$9.74 in balance, five about \$24.36. Nothing extra is charged, the balance just has to be there, and billing continues a day at a time. A create (or a resize, counted at the new size) that would leave the fleet uncovered returns `402 insufficient_balance` with the exact amount in the message. Workspaces are also capped at 10 instances; contact [support@agent37.com](mailto:support@agent37.com) to raise it.
+
+**Renewal every 24 hours.** Each renewal extends the paid period by exactly 24 hours from the previous `paid_through` and debits one more day, on the instance's own schedule.
+
+**Stopped instances still bill.** An instance bills as long as it exists. Stopping releases its CPU and RAM but keeps its disk and host placement, so a stopped instance renews like a running one. Delete it to stop billing.
+
+**Delete refunds the remainder.** Deleting an instance refunds the unused part of the prepaid day, prorated, with a minimum of one hour billed.
+
+## Automatic top-up
+
+Without automatic top-up, instances are stopped when the wallet runs out. Set a rule at [dashboard/cloud/billing](https://www.agent37.com/dashboard/cloud/billing) to keep them running: when the balance falls below your threshold, your card is charged for a fixed amount. The rule is checked every hour, and once more right before any instance would be suspended, so instances stay up as long as the card charges.
+
+* Any manual top-up saves its card, and automatic top-up charges the most recently saved one. Add funds once before enabling the rule.
+* The threshold can be \$1 to \$1000. The purchase amount follows the usual \$5 to \$1000 top-up range.
+* If a charge fails, automatic top-up turns itself off and emails the workspace admins. Add funds manually, which saves a new card, then re-enable it.
+
+## Paid through and past due
+
+Every instance object reports its billing state in two fields:
+
+<ResponseField name="paid_through" type="integer | null">
+  Unix timestamp in epoch seconds. Compute is paid through this moment; each renewal extends it by 24 hours.
+</ResponseField>
+
+<ResponseField name="past_due" type="boolean">
+  `true` when a renewal could not be covered and the instance was force-stopped. Cleared by a funded start.
+</ResponseField>
+
+```json theme={null}
+{
+  "id": "ab12cd34ef",
+  "status": "stopped",
+  "paid_through": 1783641600,
+  "past_due": true
+}
+```
+
+If a renewal cannot be covered by the wallet, and [automatic top-up](#automatic-top-up) is off or could not charge, the instance is force-stopped, flagged `past_due: true`, and the workspace admins are emailed. Top up the wallet, then `POST /v1/instances/{id}/start`: a funded start re-debits a day anchored at the start time, so suspended time is never billed, and clears the flag. A start without funds returns `402 insufficient_balance`.
+
+<Tip>
+  Branch on the error `code`, not the message. See [Errors](/docs/agents-api/errors) for the full list and the response shape.
+</Tip>
+
+## Managed usage
+
+Managed LLM, Brave search, and Composio calls debit the same wallet at cost, but only within each instance's budget: a monthly cap that resets each UTC month plus optional one-time top-up headroom. The default cap is \$0, so an instance spends nothing on managed services until you raise its cap or top it up. When a managed call is refused, the 402 reason tells you which pot ran dry: `insufficient_balance` means the wallet is empty, `instance_budget_exhausted` means the wallet has funds but the instance hit its cap. See [Budgets](/docs/agents-api/budgets) for the endpoints, rates, and both 402 reasons.
+
+## Ledger and spend visibility
+
+Every wallet movement is recorded: top-ups, the signup credit, day debits, and prorated refunds land in an append-only ledger, while managed usage is metered per call into its own usage ledger and shown as a per-instance spend breakdown. Review the ledger, your balance, and the spend breakdown at [dashboard/cloud/billing](https://www.agent37.com/dashboard/cloud/billing). For managed spend on a single instance, `GET /v1/instances/{id}/usage` returns a monthly rollup; compute prepay is dashboard-only and never appears there.
+
+
+# Managed services & budgets
+Source: https://agent37.com/docs/agents-api/budgets
+
+Every instance ships with managed LLM, Brave search, and Composio credentials: metered at cost, gated by a per-instance budget you control.
+
+Every instance is created with managed credentials for three services: LLM calls, web search (Brave), and app integrations (Composio). The agent uses them out of the box. Managed calls route and meter through Agent37, so there are no provider or integration keys for you to manage.
+
+Each managed call is metered at cost against your workspace wallet, and a per-instance budget caps how much each instance can spend.
+
+## Rates
+
+| Service            | Rate                                         |
+| ------------------ | -------------------------------------------- |
+| Managed LLM        | Provider cost, passed through with no markup |
+| Web search (Brave) | \$0.005 per call (5,000 micros)              |
+| Composio           | \$0.000114 per call (114 micros)             |
+
+All money fields are integer micros: USD x 1,000,000, so \$1.00 is `1000000`. Managed spend debits the workspace wallet, the same wallet that pays for compute. Top it up at [agent37.com/dashboard/cloud/billing](https://www.agent37.com/dashboard/cloud/billing).
+
+## How budgets work
+
+A budget has two parts:
+
+* **Monthly cap.** A spending ceiling that resets at the start of each UTC month. It defaults to \$0, so managed calls are refused until you grant headroom.
+* **One-time credit.** A ceiling that persists across months and is consumed only after the monthly portion is exhausted.
+
+<Info>
+  Budget figures are ceilings, not money. The workspace wallet is the only pot of dollars; raising a cap or topping up an instance moves no funds. The sum of caps across your instances can exceed the wallet balance, which is fine: caps bound each instance, the wallet bounds the total.
+</Info>
+
+## Set a budget at create
+
+Pass `budget` in the create body to grant headroom from the first call.
+
+<ParamField type="integer">
+  Monthly managed-spend cap in micros. Resets each UTC month.
+</ParamField>
+
+<ParamField type="integer">
+  One-time headroom in micros. Persists until consumed.
+</ParamField>
+
+<CodeGroup>
+  ```bash curl theme={null}
+  curl -X POST https://api.agent37.com/v1/instances \
+    -H "Authorization: Bearer sk_live_..." \
+    -H "Content-Type: application/json" \
+    -d '{
+      "name": "research-bot",
+      "budget": { "monthly_cap_micros": 5000000, "credit_micros": 1000000 }
+    }'
+  ```
+
+  ```python python theme={null}
+  import requests
+
+  H = {"Authorization": "Bearer sk_live_...", "Content-Type": "application/json"}
+  instance = requests.post(
+      "https://api.agent37.com/v1/instances",
+      headers=H,
+      json={
+          "name": "research-bot",
+          "budget": {"monthly_cap_micros": 5000000, "credit_micros": 1000000},
+      },
+  ).json()
+  ```
+
+  ```javascript node theme={null}
+  const H = {
+    "Authorization": "Bearer sk_live_...",
+    "Content-Type": "application/json",
+  };
+  const instance = await (await fetch("https://api.agent37.com/v1/instances", {
+    method: "POST",
+    headers: H,
+    body: JSON.stringify({
+      name: "research-bot",
+      budget: { monthly_cap_micros: 5000000, credit_micros: 1000000 },
+    }),
+  })).json();
+  ```
+</CodeGroup>
+
+## Endpoints
+
+| Method  | Path                               | Returns                                          |
+| ------- | ---------------------------------- | ------------------------------------------------ |
+| `GET`   | `/v1/instances/{id}/budget`        | `200` the budget object                          |
+| `PATCH` | `/v1/instances/{id}/budget`        | `200` the updated budget object                  |
+| `POST`  | `/v1/instances/{id}/budget/top-up` | `200` the updated budget object                  |
+| `GET`   | `/v1/instances/{id}/usage`         | `200` `{ period, total_micros, by_integration }` |
+
+All three budget endpoints return the same budget object.
+
+## The budget object
+
+<ResponseField name="monthly_cap_micros" type="integer">
+  The monthly spending ceiling.
+</ResponseField>
+
+<ResponseField name="monthly_consumed_micros" type="integer">
+  Managed spend counted against the cap this month.
+</ResponseField>
+
+<ResponseField name="monthly_remaining_micros" type="integer">
+  `monthly_cap_micros` minus `monthly_consumed_micros`, floored at 0.
+</ResponseField>
+
+<ResponseField name="monthly_period" type="string">
+  The UTC month the counters cover, formatted `YYYY-MM`.
+</ResponseField>
+
+<ResponseField name="credit_remaining_micros" type="integer">
+  One-time headroom left. Consumed only after the monthly portion is exhausted.
+</ResponseField>
+
+<ResponseField name="updated_at" type="integer">
+  Epoch seconds of the last budget write. The budget is first written when the instance is created; cap changes, top-ups, and managed spend all update it.
+</ResponseField>
+
+<CodeGroup>
+  ```bash curl theme={null}
+  curl https://api.agent37.com/v1/instances/ab12cd34ef/budget \
+    -H "Authorization: Bearer sk_live_..."
+  ```
+
+  ```json response theme={null}
+  {
+    "monthly_cap_micros": 5000000,
+    "monthly_consumed_micros": 412380,
+    "monthly_remaining_micros": 4587620,
+    "monthly_period": "2026-06",
+    "credit_remaining_micros": 1000000,
+    "updated_at": 1781136000
+  }
+  ```
+</CodeGroup>
+
+## Set the monthly cap
+
+`PATCH /v1/instances/{id}/budget` sets the cap for the current and future months. It takes effect immediately.
+
+<ParamField type="integer">
+  The new monthly cap in micros. Must be a non-negative integer.
+</ParamField>
+
+<CodeGroup>
+  ```bash curl theme={null}
+  curl -X PATCH https://api.agent37.com/v1/instances/ab12cd34ef/budget \
+    -H "Authorization: Bearer sk_live_..." \
+    -H "Content-Type: application/json" \
+    -d '{ "monthly_cap_micros": 20000000 }'
+  ```
+
+  ```python python theme={null}
+  budget = requests.patch(
+      "https://api.agent37.com/v1/instances/ab12cd34ef/budget",
+      headers=H,
+      json={"monthly_cap_micros": 20000000},
+  ).json()
+  ```
+
+  ```javascript node theme={null}
+  const budget = await (await fetch(
+    "https://api.agent37.com/v1/instances/ab12cd34ef/budget",
+    {
+      method: "PATCH",
+      headers: H,
+      body: JSON.stringify({ monthly_cap_micros: 20000000 }),
+    },
+  )).json();
+  ```
+</CodeGroup>
+
+Setting the cap to `0` turns managed services off for the instance once any remaining top-up headroom is consumed.
+
+## Add one-time headroom
+
+`POST /v1/instances/{id}/budget/top-up` adds to `credit_remaining_micros`. Use it for a burst of work you don't want to bake into the monthly cap.
+
+<ParamField type="integer">
+  Headroom to add, in micros. Must be a positive integer.
+</ParamField>
+
+<ParamField type="string">
+  Up to 64 characters matching `^[A-Za-z0-9_-]{1,64}$`. Repeating a request with the same key returns the current budget without adding again, so retries are safe.
+</ParamField>
+
+<CodeGroup>
+  ```bash curl theme={null}
+  curl -X POST https://api.agent37.com/v1/instances/ab12cd34ef/budget/top-up \
+    -H "Authorization: Bearer sk_live_..." \
+    -H "Content-Type: application/json" \
+    -d '{ "amount_micros": 10000000, "idempotency_key": "june-burst-1" }'
+  ```
+
+  ```python python theme={null}
+  budget = requests.post(
+      "https://api.agent37.com/v1/instances/ab12cd34ef/budget/top-up",
+      headers=H,
+      json={"amount_micros": 10000000, "idempotency_key": "june-burst-1"},
+  ).json()
+  ```
+
+  ```javascript node theme={null}
+  const budget = await (await fetch(
+    "https://api.agent37.com/v1/instances/ab12cd34ef/budget/top-up",
+    {
+      method: "POST",
+      headers: H,
+      body: JSON.stringify({
+        amount_micros: 10000000,
+        idempotency_key: "june-burst-1",
+      }),
+    },
+  )).json();
+  ```
+</CodeGroup>
+
+## Read managed spend
+
+`GET /v1/instances/{id}/usage?month=YYYY-MM` returns the instance's managed-spend rollup for one UTC month. Omit `month` for the current month; an invalid value returns 400.
+
+<ResponseField name="period" type="string">
+  The UTC month covered, formatted `YYYY-MM`.
+</ResponseField>
+
+<ResponseField name="total_micros" type="integer">
+  Total managed spend for the month.
+</ResponseField>
+
+<ResponseField name="by_integration" type="object">
+  Per-service breakdown. `llm` carries `cost_micros`, `calls`, `input_tokens`, and `output_tokens`; `brave` and `composio` carry `cost_micros` and `calls`.
+</ResponseField>
+
+<CodeGroup>
+  ```bash curl theme={null}
+  curl "https://api.agent37.com/v1/instances/ab12cd34ef/usage?month=2026-06" \
+    -H "Authorization: Bearer sk_live_..."
+  ```
+
+  ```json response theme={null}
+  {
+    "period": "2026-06",
+    "total_micros": 412380,
+    "by_integration": {
+      "llm": {
+        "cost_micros": 391582,
+        "calls": 42,
+        "input_tokens": 184032,
+        "output_tokens": 96110
+      },
+      "brave": { "cost_micros": 20000, "calls": 4 },
+      "composio": { "cost_micros": 798, "calls": 7 }
+    }
+  }
+  ```
+</CodeGroup>
+
+<Note>
+  Usage covers managed spend only. Compute prepay never appears here; the full billing ledger lives in the dashboard, not on `/v1`. See [Billing](/docs/agents-api/billing).
+</Note>
+
+## When a managed call is refused
+
+A managed call that can't be covered fails with a 402 carrying one of two reasons. The instance keeps running either way; only managed calls are refused, and the refusal surfaces inside the instance on the call the agent was making, so the agent typically reports it in its reply.
+
+| Reason                      | What happened                                           | Fix                                                                                                          |
+| --------------------------- | ------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
+| `insufficient_balance`      | The workspace wallet is empty.                          | Top up the wallet at [agent37.com/dashboard/cloud/billing](https://www.agent37.com/dashboard/cloud/billing). |
+| `instance_budget_exhausted` | The wallet has funds, but this instance hit its budget. | Raise the monthly cap with `PATCH .../budget`, or add headroom with `POST .../budget/top-up`.                |
+
+For the hosting API error catalog, see [Errors](/docs/agents-api/errors).
+
+## Connecting apps
+
+The agent connects apps in conversation; there are no integration endpoints to call. Ask it to connect Gmail, Slack, Notion, or any other Composio-supported app, and it replies with an authorization link. Your user opens the link and grants access; Composio handles the OAuth. From the next turn on, the agent can use the app.
+
+## Bring your own keys
+
+To run a service on your own account, put your own provider key inside the instance with [exec](/docs/agents-api/exec) or the agent's in-instance config. Calls made with your own keys go straight to the provider and never touch the managed meter or the budget.
+
+
+# Send a message
+Source: https://agent37.com/docs/agents-api/chat
+
+The core call: POST /v1/responses on your instance URL runs a turn through your agent, streams or returns the result, and continues the thread.
+
+`POST /v1/responses` is the core call. You make it against your instance, not against `api.agent37.com`: every instance serves its own chat API at `https://{instanceId}.agent37.app`, the `url` of the default port in the create response. This page uses `https://ab12cd34ef.agent37.app`. Authenticate with the same `sk_live_` key you use on the hosting API.
+
+The call is agentic by default: the agent can browse, run code, use a terminal, read and write files, call connected tools, and reason across many steps before answering.
+
+## Request body
+
+Request bodies are capped at 2 MB; anything larger returns `413 payload_too_large`.
+
+<ParamField type="string">
+  The message or task, a plain string. There is no image field; to attach files, upload them first and list their paths in `files`. See [Sessions and models](/docs/agents-api/sessions) for how history carries across turns.
+</ParamField>
+
+<ParamField type="string[]">
+  Paths of files on the instance to attach to this turn, typically the `path` returned by [`POST /v1/files`](/docs/agents-api/files). Each must name an existing file on the instance, or the call returns `400 validation_error`. The paths are appended to the input, and the agent reads them from disk.
+</ParamField>
+
+<ParamField type="string">
+  Continue an existing conversation. Omit it to start a new one; the response returns the new session's id. An unknown id returns `404 session_not_found`.
+</ParamField>
+
+<ParamField type="boolean">
+  `true` returns a Server-Sent Events stream; `false` returns the finished response as one JSON body. See [Streaming](/docs/agents-api/streaming).
+</ParamField>
+
+<ParamField type="string">
+  The LLM to run this turn on. Omit it to use the session's current model (the instance default on a new session). List what the instance can run with `GET /v1/models`; see [Sessions and models](/docs/agents-api/sessions).
+</ParamField>
+
+<ParamField type="string">
+  The model's provider, for example `anthropic`. Both `model` and `provider` are set per turn, and sending them on a continuation updates the session's stored pair for the turns that follow.
+</ParamField>
+
+<ParamField type="string">
+  How hard the model thinks: `none`, `minimal`, `low`, `medium`, `high`, or `xhigh`.
+</ParamField>
+
+<ParamField type="object">
+  Up to 16 key/value pairs, at most 64 KB serialized. Echoed back on the response object, never interpreted.
+</ParamField>
+
+<ParamField type="string">
+  Which agent runs the turn. It defaults to the agent your instance's template installs (`hermes` on `agent37-hermes`, `openclaw` on `agent37-openclaw`), so you normally omit it. The agent is fixed when the session is created: on a continuation (`session_id` set) this field is ignored and the turn runs on the session's original agent.
+</ParamField>
+
+<ParamField type="string">
+  `chat` runs one turn and replies. `goal` is reserved: sending it returns `400 validation_error` today.
+</ParamField>
+
+<Note>
+  `instance_id` in the body is accepted and ignored. The URL names the instance: one gateway per instance, so there is nothing to route.
+</Note>
+
+## Response
+
+The response object. Ids are 32-character hex strings; timestamps from the gateway are epoch milliseconds.
+
+<ResponseField name="id" type="string">
+  The response id. Use it to fetch, reconnect, or cancel the turn.
+</ResponseField>
+
+<ResponseField name="session_id" type="string">
+  The conversation this turn belongs to. Reuse it on the next call to continue the thread.
+</ResponseField>
+
+<ResponseField name="status" type="string">
+  `in_progress`, then a terminal `completed`, `failed`, or `cancelled`.
+</ResponseField>
+
+<ResponseField name="agent" type="string">
+  The agent that ran the turn, `hermes` or `openclaw`.
+</ResponseField>
+
+<ResponseField name="model" type="string | null">
+  The model the turn ran on, `null` when none was set.
+</ResponseField>
+
+<ResponseField name="provider" type="string | null">
+  The model's provider, `null` when none was set.
+</ResponseField>
+
+<ResponseField name="output_text" type="string">
+  The agent's final answer. Always a string, empty if the turn produced none.
+</ResponseField>
+
+<ResponseField name="usage" type="object | null">
+  Token counts and cost for the turn: `{ input_tokens, output_tokens, cost_usd }`. `cost_usd` is absent or `null` when the provider did not report a cost.
+</ResponseField>
+
+<ResponseField name="error" type="object | null">
+  Set when the turn failed: `{ code, message, param?, hint? }`. See [Errors](/docs/agents-api/errors).
+</ResponseField>
+
+<ResponseField name="metadata" type="object | null">
+  Your request metadata, echoed back verbatim.
+</ResponseField>
+
+<ResponseField name="created" type="number">
+  When the turn started, epoch milliseconds.
+</ResponseField>
+
+<Note>
+  A failed turn does not reject the HTTP call. The POST still returns 200 with `status: "failed"` and `error` set. Branch on `status`, not on the HTTP code.
+</Note>
+
+<Note>
+  On a non-streaming call the gateway sends the `200` and headers as soon as the turn starts, then keeps the connection alive with a whitespace tick every 25 seconds while the agent works. The JSON body arrives when the turn finishes, prefixed by that whitespace — leading whitespace is valid JSON, so standard parsers handle it unchanged. Don't treat the early headers as the response being ready.
+</Note>
+
+## Example
+
+<CodeGroup>
+  ```bash curl theme={null}
+  curl https://ab12cd34ef.agent37.app/v1/responses \
+    -H "Authorization: Bearer sk_live_..." \
+    -H "Content-Type: application/json" \
+    -d '{
+      "input": "Research the top 3 EV makers, write a memo."
+    }'
+  ```
+
+  ```python python theme={null}
+  import requests
+
+  r = requests.post(
+      "https://ab12cd34ef.agent37.app/v1/responses",
+      headers={
+          "Authorization": "Bearer sk_live_...",
+          "Content-Type": "application/json",
+      },
+      json={"input": "Research the top 3 EV makers, write a memo."},
+  ).json()
+  ```
+
+  ```javascript node theme={null}
+  const r = await (await fetch("https://ab12cd34ef.agent37.app/v1/responses", {
+    method: "POST",
+    headers: {
+      "Authorization": "Bearer sk_live_...",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      input: "Research the top 3 EV makers, write a memo.",
+    }),
+  })).json();
+  ```
+
+  ```json response theme={null}
+  {
+    "id": "c91d2a7e84f04b6f9a3d5e1c0b87f4a2",
+    "session_id": "7f3e0b6c52a949d2b1c4a8e9d0f31726",
+    "status": "completed",
+    "agent": "hermes",
+    "model": null,
+    "provider": null,
+    "output_text": "Memo: the top 3 EV makers...",
+    "usage": { "input_tokens": 1840, "output_tokens": 920, "cost_usd": 0.0137 },
+    "error": null,
+    "metadata": null,
+    "created": 1781136000000
+  }
+  ```
+</CodeGroup>
+
+<Tip>
+  Set `stream: true` to receive Server-Sent Events as the agent reasons, calls tools, and writes its answer. The terminal event carries the final `output_text` and `usage`. See [Streaming](/docs/agents-api/streaming).
+</Tip>
+
+## Continue a conversation
+
+The first message omits `session_id` and starts a session. The reply returns a `session_id`; pass it on the next message to continue the same thread. The session holds the full history, so you never resend a transcript: you send only the new input.
+
+<CodeGroup>
+  ```bash curl theme={null}
+  # 1. start a session: omit session_id
+  curl https://ab12cd34ef.agent37.app/v1/responses \
+    -H "Authorization: Bearer sk_live_..." \
+    -H "Content-Type: application/json" \
+    -d '{
+      "input": "Research the top 3 EV makers, write a memo."
+    }'
+  # -> { "id": "c91d2a7e84f04b6f9a3d5e1c0b87f4a2",
+  #      "session_id": "7f3e0b6c52a949d2b1c4a8e9d0f31726",
+  #      "status": "completed", ... }
+
+  # 2. continue it: reuse the session_id, send only the new input
+  curl https://ab12cd34ef.agent37.app/v1/responses \
+    -H "Authorization: Bearer sk_live_..." \
+    -H "Content-Type: application/json" \
+    -d '{
+      "session_id": "7f3e0b6c52a949d2b1c4a8e9d0f31726",
+      "input": "Make it shorter, add a quote."
+    }'
+  ```
+
+  ```python python theme={null}
+  import requests
+
+  BASE = "https://ab12cd34ef.agent37.app"
+  H = {"Authorization": "Bearer sk_live_...", "Content-Type": "application/json"}
+
+  # 1. start a session: omit session_id
+  first = requests.post(
+      f"{BASE}/v1/responses",
+      headers=H,
+      json={"input": "Research the top 3 EV makers, write a memo."},
+  ).json()
+
+  # 2. continue it: reuse the session_id, send only the new input
+  requests.post(
+      f"{BASE}/v1/responses",
+      headers=H,
+      json={
+          "session_id": first["session_id"],
+          "input": "Make it shorter, add a quote.",
+      },
+  )
+  ```
+
+  ```javascript node theme={null}
+  const BASE = "https://ab12cd34ef.agent37.app";
+  const H = {
+    Authorization: "Bearer sk_live_...",
+    "Content-Type": "application/json",
+  };
+
+  // 1. start a session: omit session_id
+  const first = await (await fetch(`${BASE}/v1/responses`, {
+    method: "POST",
+    headers: H,
+    body: JSON.stringify({
+      input: "Research the top 3 EV makers, write a memo.",
+    }),
+  })).json();
+
+  // 2. continue it: reuse the session_id, send only the new input
+  await fetch(`${BASE}/v1/responses`, {
+    method: "POST",
+    headers: H,
+    body: JSON.stringify({
+      session_id: first.session_id,
+      input: "Make it shorter, add a quote.",
+    }),
+  });
+  ```
+</CodeGroup>
+
+<Note>
+  **One active turn per session.** A session runs one response at a time. Sending new input while one is in flight returns `409 session_busy`. Use another session, or cancel the running turn first.
+</Note>
+
+To list a user's threads, read a thread's history, delete one, or pick a model, see [Sessions and models](/docs/agents-api/sessions).
+
+## Follow up on a response
+
+Every response has an id you can use after the call returns.
+
+| Method | Path                        | Returns                                                     |
+| ------ | --------------------------- | ----------------------------------------------------------- |
+| `GET`  | `/v1/responses/{id}`        | `200` the response object                                   |
+| `GET`  | `/v1/responses/{id}/stream` | `200` an SSE stream: replays all events, then attaches live |
+| `POST` | `/v1/responses/{id}/cancel` | `200` the current response object                           |
+
+`GET /v1/responses/{id}` returns the response object at any time, before or after the turn finishes.
+
+`GET /v1/responses/{id}/stream` replays every event so far in order, then stays attached live, so a dropped connection never loses the answer. See [Streaming](/docs/agents-api/streaming) for the replay window.
+
+`POST /v1/responses/{id}/cancel` takes no body and stops a running turn, best effort. It returns 200 with the current response object. Cancelling a finished response is a no-op that returns its terminal state, still 200.
+
+<Warning>
+  Cancel does not rewind. Whatever the agent has already done (files written, emails sent, tools called) is not undone. The response ends with `status: "cancelled"`.
+</Warning>
+
+## Status values
+
+A response moves from `in_progress` to exactly one terminal status.
+
+| Status        | Meaning                                               |
+| ------------- | ----------------------------------------------------- |
+| `in_progress` | The turn is running.                                  |
+| `completed`   | The turn finished and `output_text` holds the answer. |
+| `failed`      | The turn ended on an error; `error` says why.         |
+| `cancelled`   | You stopped the turn with `cancel`.                   |
+
+
+# Build a chat app
+Source: https://agent37.com/docs/agents-api/chat-app
+
+Give every user their own always-on agent. The simplest thing to build on the Agent API, and where most teams start.
+
+The pattern is four calls: create one instance per user at signup, start one session per chat thread, list sessions for the sidebar, and fetch one session for the open thread.
+
+<Card title="hermes-chat: this guide as a working app" icon="github" href="https://github.com/agent37-platform/examples/tree/main/hermes-chat">
+  Everything on this page, runnable: create instances from a table, stream replies token by token, list and reopen threads, cancel a turn. Express plus vanilla JS, no build step. Clone it, add your key, `npm start`.
+</Card>
+
+## One key, two base URLs
+
+<Info>
+  Two base URLs, one key: `https://api.agent37.com` manages instances, and each instance serves its own chat API at `https://{instanceId}.agent37.app` (the id is the hostname). See [Core concepts](/docs/agents-api/concepts).
+</Info>
+
+The snippets below use a small shorthand client so the calls stay readable. `api` is the hosting API; `agentOf(id)` is one user's agent.
+
+```javascript node theme={null}
+const HEADERS = {
+  Authorization: `Bearer ${process.env.AGENT37_API_KEY}`,
+  "Content-Type": "application/json",
+};
+
+function makeClient(base) {
+  return {
+    get: (path) => fetch(base + path, { headers: HEADERS }).then((r) => r.json()),
+    post: (path, body) =>
+      fetch(base + path, {
+        method: "POST",
+        headers: HEADERS,
+        body: JSON.stringify(body ?? {}),
+      }).then((r) => r.json()),
+  };
+}
+
+const api = makeClient("https://api.agent37.com");
+const agentOf = (id) => makeClient(`https://${id}.agent37.app`);
+```
+
+## The shape of it
+
+<Steps>
+  <Step title="One instance per user, on signup">
+    When a user signs up, create one [instance](/docs/agents-api/instances) for them, tagged with your own user id. That instance is their agent from then on.
+
+    ```javascript node theme={null}
+    const inst = await api.post("/v1/instances", {
+      user: "u_882",
+      name: "chat-u_882",
+      budget: { credit_micros: 1000000 },
+    });
+
+    await db.users.update("u_882", { instanceId: inst.id });
+    // inst.id is bare, e.g. "ab12cd34ef", and doubles as the hostname:
+    // https://ab12cd34ef.agent37.app
+    ```
+
+    Omitting `template` gives you `agent37-hermes`, the default, on the default 2 vCPU / 4 GB RAM / 6 GB disk shape, billed from your workspace wallet (see [Billing](/docs/agents-api/billing)). The `budget.credit_micros` field grants one-time managed-spend headroom so the agent's LLM calls work from the first message; without it the per-instance [budget](/docs/agents-api/budgets) defaults to \$0.
+
+    The call is synchronous and returns `201` with `status: "running"`: the instance's computer is up. The agent inside is still booting — usually seconds, but up to a few minutes on a cold host — so before the first message poll `GET /v1/health` on the instance URL until it answers with `"ok": true` (see [Health and version](/docs/agents-api/sessions#health-and-version)). Store `inst.id` on the user row.
+  </Step>
+
+  <Step title="A session per chat thread">
+    Each thread is a session on the user's instance. Send the first turn to the instance URL with no `session_id`; the reply mints one. Store it on your thread row, then send `session_id` plus the new `input` on every later turn. The session keeps the full history, so you never resend a transcript.
+
+    ```javascript node theme={null}
+    const agent = agentOf(user.instanceId);
+
+    // new thread: first turn, no session_id
+    const first = await agent.post("/v1/responses", {
+      input: "Research the top 3 EV makers, write a memo.",
+    });
+    await db.threads.create({ userId: "u_882", sessionId: first.session_id });
+    // first.session_id, e.g. "7f3e0b6c52a949d2b1c4a8e9d0f31726"
+
+    // later turns: session_id and the new input only
+    const reply = await agent.post("/v1/responses", {
+      session_id: thread.sessionId,
+      input: "Make it shorter, add a quote.",
+    });
+    render(reply.output_text);
+    ```
+
+    <Tip>
+      Stream every reply so the UI fills in as the agent reasons, calls tools, and writes. Set `stream: true` and read the Server-Sent Events; see [Streaming](/docs/agents-api/streaming) for the full event list and a client parser.
+    </Tip>
+  </Step>
+
+  <Step title="List threads for the sidebar">
+    `GET /v1/sessions` on the instance URL lists the harness's sessions, newest first, without history.
+
+    ```javascript node theme={null}
+    const { agent, data } = await agentOf(user.instanceId).get("/v1/sessions");
+    // Hermes: [{ id, title, model, message_count, started_at, last_active, preview }]
+    // timestamps are epoch milliseconds
+    ```
+
+    On Hermes the list already carries a `title`, and you can set it with `PATCH /v1/sessions/{id}` (`{ "title": "..." }`) — the first user message usually makes a good default. Harnesses that do not store a title answer `405`; for those, keep titles in your own database keyed by `session_id`.
+  </Step>
+
+  <Step title="Load a thread when it opens">
+    `GET /v1/sessions/{id}` returns the session with its full transcript in `history`, in order.
+
+    ```javascript node theme={null}
+    const session = await agentOf(user.instanceId).get(
+      `/v1/sessions/${thread.sessionId}`
+    );
+    // session.history: [{ id, session_id, role, content, thinking?, created_at }]
+    ```
+
+    Render each message by `role` (`user`, `assistant`, or `system`). When a user deletes a thread, `DELETE /v1/sessions/{id}` removes it; see [Sessions](/docs/agents-api/sessions).
+  </Step>
+</Steps>
+
+## Handle a busy session
+
+A session runs one response at a time. Posting a new turn while one is in flight returns `409`:
+
+```json theme={null}
+{
+  "error": {
+    "code": "session_busy",
+    "message": "A response is already running on this session.",
+    "hint": "Cancel the running response, or start another session."
+  }
+}
+```
+
+Two good ways to handle it in a chat UI:
+
+* **Disable the composer** while a turn runs, and re-enable it when the reply arrives (the non-streaming call returning, or the terminal streaming event).
+* **Offer a stop button** that calls `POST /v1/responses/{id}/cancel` on the instance URL. With `stream: true` the first event, `response.created`, hands you the response id immediately, which is what makes the button possible. Cancel is best effort: the response ends with `status: "cancelled"`, and whatever the agent already did is not undone.
+
+The [hermes-chat example](https://github.com/agent37-platform/examples/tree/main/hermes-chat) wires up both: the composer locks while a turn is in flight, and the stop button cancels it.
+
+Other threads are unaffected: each session has its own lock, so one user can run turns in several threads at once.
+
+
+# Core concepts
+Source: https://agent37.com/docs/agents-api/concepts
+
+The two planes, the resource model, and the money model behind every Agent37 Cloud call.
+
+Agent37 Cloud is two APIs that share one key, and three resources that nest.
+
+## Two planes, one key
+
+| Plane           | Base URL                           | What it serves                                                                                                                                                                           |
+| --------------- | ---------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Hosting API** | `https://api.agent37.com/v1`       | Manages the fleet: [instances](/docs/agents-api/instances), [templates](/docs/agents-api/templates), [budgets](/docs/agents-api/budgets), [exec](/docs/agents-api/exec).                                     |
+| **Agent API**   | `https://{instanceId}.agent37.app` | The agent itself. Every instance serves its own API: `POST /v1/responses` for [chat](/docs/agents-api/chat), plus `/v1/sessions`, `/v1/files`, `/v1/models`, `/v1/health`, and `/v1/version`. |
+
+Both planes take the same `Authorization: Bearer sk_live_...` header. Mint keys in the [dashboard](https://www.agent37.com/dashboard/cloud/api-keys); each key is scoped to one workspace. On the hosting API the key selects your workspace. On an instance URL, the platform edge authenticates the key, verifies the instance belongs to your workspace, and forwards the request to the gateway running inside the instance.
+
+So you create an instance with one call to `api.agent37.com`, then talk to it at its own hostname:
+
+```bash theme={null}
+curl https://ab12cd34ef.agent37.app/v1/responses \
+  -H "Authorization: Bearer sk_live_..." \
+  -H "Content-Type: application/json" \
+  -d '{ "input": "Research the top 3 EV makers, write a memo." }'
+```
+
+<Note>
+  Instance URLs require auth on every request: the `Authorization` Bearer for API calls, or a time-boxed [signed URL](/docs/agents-api/urls#browser-access-with-signed-urls) to open a preview URL in a browser tab. An unauthenticated request gets a 401.
+</Note>
+
+## The resource model
+
+| Concept      | What it is                                                                                                                                                                                                                             |
+| ------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Instance** | An isolated, always-on computer that runs your agent. Built from a [template](/docs/agents-api/templates). Persistent until you delete it, and billed hourly — prepaid a day at a time — for as long as it exists. Create one per end user. |
+| **Session**  | One conversation on an instance. A message starts one; reuse its `session_id` to continue. An instance can hold many.                                                                                                                  |
+| **Response** | One agentic turn: your input, the agent's work, its reply. Stream it live or fetch it by id.                                                                                                                                           |
+
+<Info>
+  **The agent is not the model.** The *template* installs the agent software, the *gateway* inside the instance runs your sessions on it (Hermes and OpenClaw are the live agents today; Claude Code and Codex are coming soon), and the *model* is the LLM the agent thinks with, chosen per turn as `model` + `provider`.
+</Info>
+
+### How they fit together
+
+* Create an **instance** once per end user with `POST /v1/instances` on the hosting API. It keeps files, connected accounts, and memory across every session.
+* Start a **session** by sending a message to the instance's own URL: `POST https://{instanceId}.agent37.app/v1/responses`. Omit `session_id` and the gateway mints a new session; the reply carries the `session_id` you reuse to continue the thread. See [Sessions](/docs/agents-api/sessions).
+* Each message produces a **response**. Stream it live with `stream: true` (see [Streaming](/docs/agents-api/streaming)), fetch it later with `GET /v1/responses/{id}`, or reconnect a dropped stream with `GET /v1/responses/{id}/stream`.
+
+## Templates declare ports, instances snapshot them
+
+A template declares which ports its image listens on, with at most one marked `default`. When you create an instance, it snapshots the template's ports, and the instance object returns a URL per port:
+
+* The **default port** gets the instance's own URL, `https://{instanceId}.agent37.app`. The default template, `agent37-hermes`, serves the gateway there, so the default port URL is the chat URL.
+* **Non-default ports** each get a derivable **preview URL**, `https://{instanceId}-{port}.agent37.app` — for example `https://ab12cd34ef-9119.agent37.app`.
+
+See [Instance and preview URLs](/docs/agents-api/urls) for how routing works, and [Templates](/docs/agents-api/templates) for declaring ports on your own images.
+
+## One wallet, per-instance caps
+
+Your workspace has exactly one pot of money: the wallet, funded by top-up from the [billing dashboard](https://www.agent37.com/dashboard/cloud/billing). Two things draw on it:
+
+* **Compute.** Each instance bills hourly, prepaid one day at a time: a day at create, then a day on each renewal. See [Billing](/docs/agents-api/billing).
+* **Managed usage.** Every instance gets managed LLM, Brave search, and Composio credentials, metered at cost as the agent uses them.
+
+Per-instance [budgets](/docs/agents-api/budgets) are caps, not money. A budget bounds how much managed spend an instance may pull from the wallet: a monthly cap that resets each UTC month (default \$0) plus one-time top-up headroom. Raising a cap moves no funds; an instance with a generous cap and an empty wallet still gets refused.
+
+## Conventions
+
+* **Instance ids** are bare 10-character lowercase alphanumerics, like `ab12cd34ef`. No prefixes. The id doubles as the DNS label in the instance URL.
+* **Session and response ids** are 32-character hex strings minted by the gateway, like `7f3e0b6c52a949d2b1c4a8e9d0f31726`.
+* **Money** is integer micros: USD x 1e6, in `*_micros` fields.
+* **Timestamps** are epoch seconds on the hosting API and epoch milliseconds on the agent API.
+* **Lists** wrap results in `{ "data": [...] }`. Instance and session lists are newest first.
+
+An instance's `status` is one of `provisioning`, `running`, `stopping`, `stopped`, `starting`, `restarting`, `updating`, `failed`, `deleting`, or `deleted`; a response's `status` is `in_progress`, `completed`, `failed`, or `cancelled`.
+
+## Next steps
+
+<CardGroup>
+  <Card title="White-label starter" icon="rocket" href="/agents-api/white-label">
+    Fork a multi-tenant dashboard and rebrand it — the fastest way to ship.
+  </Card>
+
+  <Card title="Instances" icon="server" href="/agents-api/instances">
+    Create, size, and manage the agent's computer.
+  </Card>
+
+  <Card title="Send a message" icon="send" href="/agents-api/chat">
+    The core call and its response shape.
+  </Card>
+
+  <Card title="Templates" icon="template" href="/agents-api/templates">
+    Pick a catalog agent or bring your own image.
+  </Card>
+
+  <Card title="Budgets" icon="wallet" href="/agents-api/budgets">
+    Cap each instance's managed spend.
+  </Card>
+</CardGroup>
+
+
+# Custom agent image
+Source: https://agent37.com/docs/agents-api/custom-image
+
+Start from the Hermes base, add your tools and skills, publish to a public registry, and run instances from your own image — optionally on your own model.
+
+You can run instances on your own Docker image: start from the Hermes base, add the CLIs, skills, and config your agent needs, publish it to a public registry, and [register it as a template](/docs/agents-api/templates). You can also point the agent at your own model. A complete, copy-able example — a `Dockerfile`, an example skill, a `register.sh`, and a tiny LLM proxy — lives in [`custom-agent-image/`](https://github.com/agent37-platform/whitelabel/tree/main/examples/custom-agent-image), ready to copy into your own repo.
+
+This page is the walkthrough; [Templates → build on the Hermes base image](/docs/agents-api/templates#build-on-the-hermes-base-image) is the reference for the contract.
+
+## 1. Start from the base
+
+Your `Dockerfile` builds on `ghcr.io/agent37-platform/hermes-base` and adds your layers. This example installs a CLI into `/usr/local/bin` and a skill into the default-skills directory:
+
+```dockerfile theme={null}
+FROM ghcr.io/agent37-platform/hermes-base:latest
+
+USER root
+RUN apt-get update && apt-get install -y --no-install-recommends your-cli \
+ && rm -rf /var/lib/apt/lists/*
+COPY your-skill/ /usr/local/share/agent37/default-skills/your-skill/
+USER node
+```
+
+Bake binaries into `/usr/local/bin`, skills into `/usr/local/share/agent37/default-skills/` (the entrypoint copies them to `~/.hermes/skills` at boot), and everything else into `/usr/local` or `/opt` — never `/home/node` or `/home/linuxbrew`, which are masked at runtime. Keep the base `ENTRYPOINT`. See [the contract](/docs/agents-api/templates#build-on-the-hermes-base-image).
+
+<Tip>
+  `:latest` tracks the newest base, so getting-started builds never go stale. For reproducible production builds, pin a date tag instead — the current one is on the [Templates](/docs/agents-api/templates#build-on-the-hermes-base-image) page.
+</Tip>
+
+Test the build before you publish:
+
+```bash theme={null}
+docker build --platform linux/amd64 -t my-agent .
+```
+
+## 2. Publish to a public registry
+
+Push the image to any public registry. GitHub Container Registry is the least setup, because GitHub Actions can build and push it with the built-in token — no secrets. The example folder ships a reference workflow that does exactly this.
+
+The image must be **public**, built for **`linux/amd64`**, and **at most 5 GB** compressed. On GHCR, make the package public once after the first push (**Packages** → **Package settings** → **Change visibility** → **Public**); Agent37 pulls anonymously.
+
+<Note>
+  Build for `linux/amd64` even on an Apple Silicon Mac (`docker build --platform=linux/amd64 ...`). A stray arm64 image fails to start.
+</Note>
+
+## 3. Register and run
+
+Register the published image as a template (pin a tag, not `latest`), then create an instance:
+
+```bash curl theme={null}
+curl -X POST https://api.agent37.com/v1/templates \
+  -H "Authorization: Bearer sk_live_..." \
+  -H "Content-Type: application/json" \
+  -d '{ "name": "my-custom-agent", "image_ref": "ghcr.io/you/my-agent:<tag>" }'
+
+curl -X POST https://api.agent37.com/v1/instances \
+  -H "Authorization: Bearer sk_live_..." \
+  -H "Content-Type: application/json" \
+  -d '{ "template": "my-custom-agent" }'
+```
+
+The result is a standard Agent37 instance running your image: same [lifecycle](/docs/agents-api/instances), [exec](/docs/agents-api/exec), and routed URLs as any other. Confirm your CLI shipped, without needing a model:
+
+```bash curl theme={null}
+curl -X POST https://api.agent37.com/v1/instances/<id>/exec \
+  -H "Authorization: Bearer sk_live_..." \
+  -H "Content-Type: application/json" \
+  -d '{ "command": "your-cli --version" }'
+```
+
+## 4. Bring your own model
+
+`hermes-base` is clean: it boots with no LLM provider (standard Agent37 instances use Agent37's managed model; this base is for bringing your own). To run an instance on your own model, point Hermes at any OpenAI-compatible endpoint — your own proxy, or a provider directly — by writing `~/.hermes/config.yaml` on the instance:
+
+```yaml theme={null}
+model:
+  provider: "custom:MyProvider"
+  default: "moonshotai/kimi-k2.7-code"        # the model id your endpoint serves
+custom_providers:
+  - name: "MyProvider"
+    base_url: "https://your-llm-proxy.example.com/v1"   # must end in /v1
+    api_key: "your-proxy-token"
+    api_mode: "chat_completions"
+    model: "moonshotai/kimi-k2.7-code"
+```
+
+Your endpoint must serve the two OpenAI-compatible routes Hermes uses: `GET /v1/models` (to resolve the model id) and `POST /v1/chat/completions` (the turn). The example folder includes a \~40-line `llm-proxy/` that implements exactly these and forwards to OpenRouter with your key — a minimal pattern to deploy and adapt.
+
+Write the config over [exec](/docs/agents-api/exec) or the instance terminal; it lives on the persistent volume, so it survives restarts. Then [send a message](/docs/agents-api/chat) and the agent runs on your model.
+
+<Tip>
+  Want chat to work out of the box on Agent37's managed model instead? Build `FROM ghcr.io/agent37-platform/hermes:<tag>` — the full image wires the managed model — and pass a [budget](/docs/agents-api/budgets) on create.
+</Tip>
+
+## Keep it current
+
+Pin the base tag; `latest` floats. When you change your image, republish, point the template at the new tag with `PATCH /v1/templates/{name}`, and [update each instance](/docs/agents-api/instances) to pick it up. A skill already seeded into an instance's `~/.hermes/skills` is not overwritten on update — only fresh instances get a changed skill.
+
+
+# Errors
+Source: https://agent37.com/docs/agents-api/errors
+
+Stable, machine-readable error codes on both planes: branch on the code, show the message.
+
+Every error uses a standard HTTP status code and returns a stable, machine-readable code in a JSON `error` field — an object with a `code` on both API catalogs, a flat string on transport failures between you and the gateway. Branch on the code, never on `message` or the HTTP status alone. There are two catalogs because there are two planes, plus a short list of transport errors.
+
+<Info>
+  Both planes take the same `sk_live_` Bearer key, but their error envelopes differ: the Agent API adds optional `param` and `hint` fields. See [Core concepts](/docs/agents-api/concepts) for the two planes.
+</Info>
+
+## Hosting API errors
+
+Errors from `https://api.agent37.com/v1/*` always carry exactly `code` and `message`. There is no `param` or `hint` on this plane.
+
+```json theme={null}
+{
+  "error": {
+    "code": "insufficient_balance",
+    "message": "This instance costs $0.0068 per hour, billed one day in advance ($0.1624). Add balance to your workspace and try again."
+  }
+}
+```
+
+<ResponseField name="error.code" type="string">
+  A stable, machine-readable identifier. Branch on this.
+</ResponseField>
+
+<ResponseField name="error.message" type="string">
+  A human-readable description. Safe to show, but do not parse it.
+</ResponseField>
+
+### Hosting API codes
+
+| Code                     | HTTP    | When                                                                                                                                                                                                   |
+| ------------------------ | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `invalid_api_key`        | 401     | The `sk_live_` Bearer key is missing, malformed, or revoked, on any `/v1` path.                                                                                                                        |
+| `invalid_request`        | 400     | A request field is invalid: bad JSON, an unsupported resource shape, a direct image ref where a template name belongs, a lifecycle action in the wrong state, or a non-empty `update` body.            |
+| `forbidden`              | 403     | A write to a system template. System templates are read-only.                                                                                                                                          |
+| `not_found`              | 404     | No instance or template with that id or name in your workspace, or an unknown `/v1` path.                                                                                                              |
+| `insufficient_balance`   | 402     | The wallet cannot cover a day of compute (at create, or at `start` of a `past_due` instance), or does not hold 30 days of compute for the whole fleet when creating or resizing beyond one instance.   |
+| `instance_limit_reached` | 409     | The workspace is at its instance limit: one instance on the free credit, 10 once you have topped up. Contact support to raise it.                                                                      |
+| `tier_limit`             | 403     | Create or resize asks for a shape larger than your plan includes. Free workspaces (before your first top-up) run any template up to the 2 vCPU / 4 GB shape; a top-up unlocks the 4/8 and 8/16 shapes. |
+| `capacity_unavailable`   | 409     | `start` or `resize`: the pinned host cannot re-reserve this instance's compute, or fit the resize increase, right now.                                                                                 |
+| `template_conflict`      | 409     | A template create or rename targets a name that already exists.                                                                                                                                        |
+| `no_capacity`            | 503     | Create only: no host can fit the requested shape right now. Safe to retry.                                                                                                                             |
+| `provisioning_failed`    | 502/500 | A container or host operation failed (image pull, container start, lifecycle action). Failed creates are fully refunded.                                                                               |
+
+<Note>
+  Lookups are uniform: an id that belongs to another workspace returns the same 404 as an id that does not exist, and unknown `/v1` paths 404 only after your key is validated. Nothing about other workspaces leaks through error responses.
+</Note>
+
+## Agent API errors
+
+Errors from the gateway at `https://{instanceId}.agent37.app/v1/*` use the same envelope plus optional `param` and `hint`.
+
+```json theme={null}
+{
+  "error": {
+    "code": "validation_error",
+    "message": "goal mode is not yet supported on this gateway.",
+    "param": "mode",
+    "hint": "Use mode \"chat\"."
+  }
+}
+```
+
+<ResponseField name="error.param" type="string">
+  The request field that was invalid. Present on `validation_error` when a specific field is at fault; a malformed JSON body has no `param`.
+</ResponseField>
+
+<ResponseField name="error.hint" type="string">
+  A suggested next step, when one applies.
+</ResponseField>
+
+### Transport errors
+
+Auth, instance lookup, and routing happen on the platform between you and the gateway, and rejections there use a flat string instead of the envelope: `{"error": "<code>"}`. Some carry a human-readable `message` (and, on a 401 with no credentials, a `docs` link); branch on the code, not on either. Check whether `error` is a string before reading `code`.
+
+| Code                    | HTTP | When                                                                                                                                                                                                   |
+| ----------------------- | ---- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `invalid_api_key`       | 401  | No credential, or a key or signed URL that did not verify. The `message` says which, and how to authenticate a browser request.                                                                        |
+| `not_found`             | 404  | An instance URL that does not route: unknown, deleted, `failed`, or another workspace's.                                                                                                               |
+| `container_unavailable` | 502  | The instance is not running, typically `stopped`. Start it and retry.                                                                                                                                  |
+| `container_unreachable` | 502  | The instance is up but its service did not answer on the routed port — common briefly during a restart or update. Transient; retry.                                                                    |
+| `upstream_unreachable`  | 502  | The platform could not reach the instance's host. Transient; retry.                                                                                                                                    |
+| `instance_saturated`    | 503  | Too many concurrent requests in flight to this instance. Back off and retry.                                                                                                                           |
+| `host_mesh_not_ready`   | 503  | The instance's host is still joining the platform network. Transient; retry.                                                                                                                           |
+| `upstream_timeout`      | 504  | A call produced no response headers for \~100 seconds — typically a wedged instance. The turn may still be running: recover the result through its session, and prefer `stream: true` to see progress. |
+| `internal_error`        | 500  | Unexpected platform error.                                                                                                                                                                             |
+
+### Agent API codes
+
+| Code                 | HTTP | When                                                                                                         |
+| -------------------- | ---- | ------------------------------------------------------------------------------------------------------------ |
+| `validation_error`   | 400  | A request field is invalid (`param` names it), the body is not valid JSON, or `mode` is `"goal"` (reserved). |
+| `session_not_found`  | 404  | No session with that id.                                                                                     |
+| `response_not_found` | 404  | No response with that id.                                                                                    |
+| `file_not_found`     | 404  | No file at that path (`GET /v1/files/content`).                                                              |
+| `not_found`          | 404  | Unknown route on the instance URL.                                                                           |
+| `session_busy`       | 409  | A response is already running on this session.                                                               |
+| `payload_too_large`  | 413  | A JSON request body exceeds 2 MB. Multipart uploads to `/v1/files` are exempt.                               |
+| `rate_limited`       | 429  | An upstream provider rate limit. Back off and retry.                                                         |
+| `agent_error`        | 502  | The agent backend failed without a more specific code.                                                       |
+| `internal_error`     | 500  | Unexpected gateway error.                                                                                    |
+
+<Note>
+  The Agent API catalog is open-ended past this table. Failures inside the agent can surface provider-specific codes at 502 or 503 (for example a provider auth or quota error passes its raw code through, and an agent that is still warming up returns 503 with its own code). Treat any code you do not recognize as an agent-side failure: log it and show `message`.
+</Note>
+
+<Note>
+  Not every failed turn is an HTTP error. `POST /v1/responses` never rejects because the agent failed mid-run: the call returns 200 with `status: "failed"` and the same error object in the response body's `error` field, and streams end with a `response.failed` event. Check `status`, not just the HTTP code. See [Send a message](/docs/agents-api/chat) and [Streaming](/docs/agents-api/streaming).
+</Note>
+
+## Handle them
+
+Read `code`, then act by remedy: busy sessions get a cancel or a new session, transient codes get a retry with backoff, validation errors get fixed (read `param`), and anything unknown is agent-side.
+
+<CodeGroup>
+  ```python python theme={null}
+  import requests
+
+  r = requests.post(
+      "https://ab12cd34ef.agent37.app/v1/responses",
+      headers={
+          "Authorization": "Bearer sk_live_...",
+          "Content-Type": "application/json",
+      },
+      json={
+          "input": "Research the top 3 EV makers, write a memo.",
+          "session_id": "7f3e0b6c52a949d2b1c4a8e9d0f31726",
+      },
+  )
+
+  if not r.ok:
+      error = r.json()["error"]
+      if isinstance(error, str):
+          raise RuntimeError(f"transport error: {error}")  # flat platform error, e.g. container_unavailable
+      code = error["code"]
+      if code == "session_busy":
+          ...  # cancel the running response or start another session
+      elif code == "rate_limited":
+          ...  # transient: back off and retry
+      elif code == "validation_error":
+          raise ValueError(f"{error.get('param')}: {error['message']}")
+      else:
+          ...  # unknown codes are agent-side failures: log code, show message
+  ```
+
+  ```javascript node theme={null}
+  const res = await fetch("https://ab12cd34ef.agent37.app/v1/responses", {
+    method: "POST",
+    headers: {
+      "Authorization": "Bearer sk_live_...",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      input: "Research the top 3 EV makers, write a memo.",
+      session_id: "7f3e0b6c52a949d2b1c4a8e9d0f31726",
+    }),
+  });
+
+  if (!res.ok) {
+    const { error } = await res.json();
+    if (typeof error === "string") {
+      // flat platform error, e.g. "container_unavailable": see the transport table
+      throw new Error(`transport error: ${error}`);
+    }
+    switch (error.code) {
+      case "session_busy":
+        // cancel the running response or start another session
+        break;
+      case "rate_limited":
+        // transient: back off and retry
+        break;
+      case "validation_error":
+        throw new Error(`${error.param}: ${error.message}`);
+      default:
+        // unknown codes are agent-side failures: log code, show message
+        console.error(error.code, error.message);
+    }
+  }
+  ```
+</CodeGroup>
+
+The same grouping works on the Hosting API: `insufficient_balance` sends your user to the billing dashboard, `no_capacity` is retryable, and `invalid_request` means fix the request before retrying.
+
+<Tip>
+  `no_capacity` (503, hosting) and `rate_limited` (429, agent) are safe to retry with backoff. So is a `provisioning_failed` create: failed creates are fully refunded, so retrying never double-bills.
+</Tip>
+
+## Codes worth a closer look
+
+<AccordionGroup>
+  <Accordion title="insufficient_balance (402): the workspace wallet is empty" icon="wallet">
+    The workspace wallet cannot cover a charge. You see it in four places: at create, when the first day (billed in advance) cannot be debited; at create or resize beyond one instance, when the balance does not hold 30 days of compute for the whole fleet (the message names the exact amount); at `start`, when a `past_due` instance's next day cannot be re-debited; and inside agent behavior, when a managed call (LLM, Brave search, Composio) finds the wallet empty. The fix is the same everywhere: top up the wallet at `https://www.agent37.com/dashboard/cloud/billing` (\$5 minimum, \$1000 max per top-up), and enable [automatic top-up](/docs/agents-api/billing#automatic-top-up) so it does not recur. See [Billing](/docs/agents-api/billing).
+  </Accordion>
+
+  <Accordion title="instance_budget_exhausted (402): this instance hit its budget" icon="gauge">
+    The wallet has funds, but this instance has used up its own managed-spend budget: the monthly cap is consumed and no one-time top-up headroom remains. Only managed calls are refused; the instance keeps running and compute billing is unaffected. Raise the cap with `PATCH /v1/instances/{id}/budget` or add headroom with `POST /v1/instances/{id}/budget/top-up`. See [Budgets](/docs/agents-api/budgets). You will not see this code on Hosting API calls: it surfaces when the agent's managed calls are refused mid-turn.
+  </Accordion>
+
+  <Accordion title="session_busy (409): one response at a time" icon="clock">
+    A session runs one response at a time. Posting new input while a turn is in flight returns this, with a `hint` naming both ways out: cancel the running turn with `POST /v1/responses/{id}/cancel` (best effort; a finished response just returns its terminal state), or start a fresh session by omitting `session_id`. See [Sessions](/docs/agents-api/sessions).
+  </Accordion>
+
+  <Accordion title="The capacity trio: instance_limit_reached, capacity_unavailable, no_capacity" icon="server">
+    Three different walls, three different fixes. `instance_limit_reached` (409, create): the workspace is at its instance limit (one instance on the free credit, 10 once you have topped up); delete instances you no longer need, or contact [support@agent37.com](mailto:support@agent37.com) to raise the ceiling. `no_capacity` (503, create): no host can fit the requested shape right now; retry with backoff or pick a smaller shape, and a create that fails this way does not keep your money. `capacity_unavailable` (409, start or resize): an instance stays pinned to the host that holds its disk, and that host cannot re-reserve its CPU and RAM, or fit a resize increase, right now; retry later, or create a new instance to land elsewhere. See [Instances](/docs/agents-api/instances).
+  </Accordion>
+</AccordionGroup>
+
+<Note>
+  Both 402 reasons are billing limits, not bugs. When a managed call is refused mid-turn, the refusal shows up in agent behavior (the turn fails or the agent reports it); the instance itself never goes down over managed spend.
+</Note>
+
+
+# Run commands
+Source: https://agent37.com/docs/agents-api/exec
+
+Run any shell command inside an instance from your backend, the escape hatch for anything the API does not wrap.
+
+`POST /v1/instances/{id}/exec` runs a shell command inside the instance, straight from your backend. It is the escape hatch for anything the API does not wrap as its own call.
+
+The command runs through `sh -c` as the image's default user, on the same box the agent works on, so it sees the agent's files, tools, and credentials.
+
+## Request
+
+<ParamField type="string">
+  The shell command to run inside the instance. It is passed to `sh -c`, so pipes, redirects, and `&&` chains all work.
+</ParamField>
+
+<Note>
+  Only `running` instances accept commands. Exec against any other status returns `400 invalid_request` (a deleted instance returns `404 not_found`). If the platform cannot reach the instance at all, you get `502 provisioning_failed`.
+</Note>
+
+## Response
+
+A command that runs but exits nonzero is a normal result: you get `200` with its `exit_code`, `stdout`, and `stderr`. Errors are reserved for the platform, not your command.
+
+<ResponseField name="exit_code" type="integer">
+  The command's exit code. Nonzero is still a `200`; read this to branch.
+</ResponseField>
+
+<ResponseField name="stdout" type="string">
+  Standard output, capped at 512 KB. See `truncated`.
+</ResponseField>
+
+<ResponseField name="stderr" type="string">
+  Standard error, with its own separate 512 KB cap.
+</ResponseField>
+
+<ResponseField name="truncated" type="boolean">
+  `true` when either stream spilled past its 512 KB cap. The middle of the output is cut and a truncation marker is left in its place.
+</ResponseField>
+
+<Note>
+  `exit_code` values 125, 126, and 127 may come from Docker rather than your command, for example 127 when the binary is not found. A command runs for up to 280 seconds, after which the call fails with `502 provisioning_failed`; start longer jobs in the background (`nohup ... &`) and poll with a second exec.
+</Note>
+
+## Example
+
+<CodeGroup>
+  ```bash curl theme={null}
+  curl -X POST https://api.agent37.com/v1/instances/ab12cd34ef/exec \
+    -H "Authorization: Bearer sk_live_..." \
+    -H "Content-Type: application/json" \
+    -d '{ "command": "node --version" }'
+  ```
+
+  ```python python theme={null}
+  import requests
+
+  resp = requests.post(
+      "https://api.agent37.com/v1/instances/ab12cd34ef/exec",
+      headers={"Authorization": "Bearer sk_live_..."},
+      json={"command": "node --version"},
+  )
+  result = resp.json()
+  print(result["exit_code"], result["stdout"])
+  ```
+
+  ```javascript node theme={null}
+  const resp = await fetch(
+    "https://api.agent37.com/v1/instances/ab12cd34ef/exec",
+    {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer sk_live_...",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ command: "node --version" }),
+    }
+  );
+  const result = await resp.json();
+  console.log(result.exit_code, result.stdout);
+  ```
+
+  ```json response theme={null}
+  {
+    "exit_code": 0,
+    "stdout": "v24.2.0\n",
+    "stderr": "",
+    "truncated": false
+  }
+  ```
+</CodeGroup>
+
+## Build on exec
+
+Anything the API does not wrap as its own endpoint, you build on `exec`. For moving files, prefer the instance's own [files endpoints](/docs/agents-api/files) at `https://{instanceId}.agent37.app` — `POST /v1/files` to upload, `GET /v1/files/content` to download — but a quick text read works over exec too. A "Download the report" button in your product can be one exec call that reads the file the agent wrote:
+
+```bash curl theme={null}
+curl -X POST https://api.agent37.com/v1/instances/ab12cd34ef/exec \
+  -H "Authorization: Bearer sk_live_..." \
+  -H "Content-Type: application/json" \
+  -d '{ "command": "cat ~/reports/ev-makers-memo.md" }'
+```
+
+Pushing a file in is the same trick in reverse. Encode it on your side and decode it inside the instance:
+
+```bash curl theme={null}
+curl -X POST https://api.agent37.com/v1/instances/ab12cd34ef/exec \
+  -H "Authorization: Bearer sk_live_..." \
+  -H "Content-Type: application/json" \
+  -d '{ "command": "mkdir -p ~/data && echo aGVsbG8sd29ybGQK | base64 -d > ~/data/ev-prices.csv" }'
+```
+
+For binary or large files, use the [files endpoints](/docs/agents-api/files) on the instance URL instead — `GET /v1/files/content` streams a download of any size, with no 512 KB cap — or stage them at a URL your backend controls and `curl` them down from inside the instance.
+
+
+# Files
+Source: https://agent37.com/docs/agents-api/files
+
+Upload a file for the agent to work on, and download the files it produces, straight from the instance URL.
+
+Files live on the instance's disk, in the agent's workspace. A file's absolute path is its identity: there are no file ids. You upload with one call, attach the returned path to [a message](/docs/agents-api/chat), and download anything the agent produces by path.
+
+The base URL is your instance URL, `https://{instanceId}.agent37.app`, with the same `sk_live_` Bearer as every other call. This page uses `https://ab12cd34ef.agent37.app`.
+
+## Upload a file
+
+`POST /v1/files` takes a multipart body with exactly one file in a `file` field and writes it into the agent's workspace, under `uploads/` with a short random prefix so repeated uploads of the same name don't overwrite each other. The response carries the absolute `path` you attach to a turn.
+
+<ParamField type="file">
+  The file, as a multipart form field named `file`. One file per request; a missing or extra file returns `400 validation_error`.
+</ParamField>
+
+<CodeGroup>
+  ```bash curl theme={null}
+  curl -X POST https://ab12cd34ef.agent37.app/v1/files \
+    -H "Authorization: Bearer sk_live_..." \
+    -F "file=@leads.csv"
+  ```
+
+  ```python python theme={null}
+  import requests
+
+  r = requests.post(
+      "https://ab12cd34ef.agent37.app/v1/files",
+      headers={"Authorization": "Bearer sk_live_..."},
+      files={"file": open("leads.csv", "rb")},
+  ).json()
+  ```
+
+  ```javascript node theme={null}
+  import fs from "node:fs";
+
+  const form = new FormData();
+  form.append("file", new Blob([await fs.promises.readFile("leads.csv")]), "leads.csv");
+  const r = await (await fetch("https://ab12cd34ef.agent37.app/v1/files", {
+    method: "POST",
+    headers: { Authorization: "Bearer sk_live_..." },
+    body: form,
+  })).json();
+  ```
+
+  ```json response theme={null}
+  {
+    "path": "/home/node/uploads/3f2a1b9c-leads.csv",
+    "filename": "leads.csv",
+    "bytes": 18244
+  }
+  ```
+</CodeGroup>
+
+<ResponseField name="path" type="string">
+  The file's absolute path on the instance. Pass it in `files` on [`POST /v1/responses`](/docs/agents-api/chat).
+</ResponseField>
+
+<ResponseField name="filename" type="string">
+  The original name you uploaded, without the storage prefix.
+</ResponseField>
+
+<ResponseField name="bytes" type="integer">
+  The stored size in bytes.
+</ResponseField>
+
+<Note>
+  The 2 MB request-body cap applies to JSON bodies only; multipart uploads are exempt. Uploads are kept until you delete them from the instance's disk yourself — there is no garbage collection.
+</Note>
+
+## Attach it to a turn
+
+Pass the returned `path` in the `files` array on [`POST /v1/responses`](/docs/agents-api/chat). The gateway appends the paths to your input and the agent reads them from disk:
+
+```bash curl theme={null}
+curl https://ab12cd34ef.agent37.app/v1/responses \
+  -H "Authorization: Bearer sk_live_..." \
+  -H "Content-Type: application/json" \
+  -d '{
+    "input": "Summarize the attached spreadsheet.",
+    "files": ["/home/node/uploads/3f2a1b9c-leads.csv"]
+  }'
+```
+
+Each entry must name an existing file on the instance, or the call returns `400 validation_error` with the hint to upload it first.
+
+## Download a file
+
+`GET /v1/files/content?path=…` streams a file off the instance — typically one the agent told you it wrote. Any size; the 512 KB [exec](/docs/agents-api/exec) output cap does not apply here.
+
+<CodeGroup>
+  ```bash curl theme={null}
+  curl -G https://ab12cd34ef.agent37.app/v1/files/content \
+    -H "Authorization: Bearer sk_live_..." \
+    --data-urlencode "path=~/reports/ev-makers-memo.md" \
+    -o ev-makers-memo.md
+  ```
+
+  ```python python theme={null}
+  import requests
+
+  r = requests.get(
+      "https://ab12cd34ef.agent37.app/v1/files/content",
+      headers={"Authorization": "Bearer sk_live_..."},
+      params={"path": "~/reports/ev-makers-memo.md"},
+  )
+  open("ev-makers-memo.md", "wb").write(r.content)
+  ```
+
+  ```javascript node theme={null}
+  import fs from "node:fs";
+
+  const res = await fetch(
+    "https://ab12cd34ef.agent37.app/v1/files/content?" +
+      new URLSearchParams({ path: "~/reports/ev-makers-memo.md" }),
+    { headers: { Authorization: "Bearer sk_live_..." } },
+  );
+  await fs.promises.writeFile("ev-makers-memo.md", Buffer.from(await res.arrayBuffer()));
+  ```
+</CodeGroup>
+
+`path` accepts absolute paths and `~/` paths (the agent's home). No file at the path returns `404 file_not_found`; a path that is not a regular file, or a missing `path` parameter, returns `400 validation_error`.
+
+## The loop
+
+Upload, attach, fetch what the agent made:
+
+1. `POST /v1/files` with the input file; keep the returned `path`.
+2. `POST /v1/responses` with your `input` and the path in `files`.
+3. When the agent replies that it wrote a file, `GET /v1/files/content?path=…` to fetch it.
+
+
+# Instances
+Source: https://agent37.com/docs/agents-api/instances
+
+Create, size, and manage the persistent computer that runs your agent.
+
+An instance is a persistent, isolated computer running your agent. Create one per end user. The call is synchronous: when `status` is `running`, the instance's computer is up and the agent inside finishes booting moments later — poll `GET /v1/health` on the instance URL until it answers `{ "ok": true }`, then message it at `https://{id}.agent37.app/v1/responses` (see [Send a message](/docs/agents-api/chat) and [Instance and preview URLs](/docs/agents-api/urls)).
+
+Creating an instance debits one day of compute from your workspace wallet, and that debit is the create gate: if the wallet cannot cover it, the create fails with `402 insufficient_balance` and nothing is provisioned. A failed create is fully refunded. From your second concurrent instance on, your balance must also hold 30 days of compute for the whole fleet; nothing extra is charged, it just has to be there. See [Billing](/docs/agents-api/billing).
+
+## Create an instance
+
+`POST /v1/instances` returns `201` with the full instance object once `status` is `running`. Every field is optional, so a `POST` with no body works: you get the default template (`agent37-hermes`) on its smallest shape, 2 vCPU / 4 GB.
+
+<ParamField type="string">
+  A template name. `agent37-hermes` (full Hermes, with browser and desktop) is the default; `agent37-hermes-small` (the lean image, no browser or desktop) and `agent37-openclaw` (OpenClaw, with a headless browser) are the other system templates. You can also pass one of your own [workspace templates](/docs/agents-api/templates) by name. Unknown names return `400 invalid_request`. Direct image references are rejected with `400`: register a template first, then pass its name.
+</ParamField>
+
+<ParamField type="object">
+  The instance shape, for example `{ "cpu": 2, "memory": 4, "disk": 6 }`. Omitted, it uses the template's smallest shape: 1 vCPU / 3 GB on `agent37-hermes-small`, 2 vCPU / 4 GB on standard templates. `agent37-hermes-small` unlocks the sub-floor 1 vCPU / 3 GB shape; standard templates use one of the three shapes below. Free workspaces (before your first top-up) can use up to the 2 vCPU / 4 GB shape; the larger 4/8 and 8/16 shapes return `403 tier_limit` until you top up. Disk is any whole number of GB within the shape's range, and defaults to the range minimum when omitted. Any other combination returns `400 invalid_request` listing the valid shapes.
+</ParamField>
+
+<ParamField type="string">
+  An opaque tag for your own attribution, typically your end user's id. Stored, never interpreted, echoed back on the instance object.
+</ParamField>
+
+<ParamField type="string">
+  A label for the instance.
+</ParamField>
+
+<ParamField type="object">
+  Your own key/value pairs. Stored, never interpreted.
+</ParamField>
+
+<ParamField type="object">
+  Caps on this instance's managed usage (managed LLM, Brave search, and Composio calls), in micros (millionths of a dollar): `monthly_cap_micros` resets each UTC month, `credit_micros` adds one-time headroom that persists until spent. Both default to `0`, so managed calls are refused until you raise one. These are ceilings, not money; spend still draws the workspace wallet. See [Budgets](/docs/agents-api/budgets).
+</ParamField>
+
+### Shapes and pricing
+
+| cpu | memory | disk     | Price at the default disk                         |
+| --- | ------ | -------- | ------------------------------------------------- |
+| 1   | 3 GB   | 6-20 GB  | \$3.44 per month (`agent37-hermes-small` only)    |
+| 2   | 4 GB   | 6-20 GB  | \$4.94 per month (default for standard templates) |
+| 4   | 8 GB   | 20-40 GB | \$10.60 per month                                 |
+| 8   | 16 GB  | 40-80 GB | \$21.20 per month                                 |
+
+Disk above the range minimum adds \$0.09 per GB per month. Compute bills hourly and is prepaid one day at a time: a day at create, then a day on each renewal. An instance bills for as long as it exists, stopped or running; deleting it refunds the unused remainder. See [Billing](/docs/agents-api/billing).
+
+### Example
+
+The `credit_micros` of `1000000` gives the instance \$1 of managed-spend headroom so its first chat works out of the box.
+
+<CodeGroup>
+  ```bash curl theme={null}
+  curl -X POST https://api.agent37.com/v1/instances \
+    -H "Authorization: Bearer sk_live_..." \
+    -H "Content-Type: application/json" \
+    -d '{
+      "template": "agent37-hermes",
+      "user": "u_882",
+      "budget": { "credit_micros": 1000000 }
+    }'
+  ```
+
+  ```python python theme={null}
+  import requests
+
+  resp = requests.post(
+      "https://api.agent37.com/v1/instances",
+      headers={"Authorization": "Bearer sk_live_..."},
+      json={
+          "template": "agent37-hermes",
+          "user": "u_882",
+          "budget": {"credit_micros": 1000000},
+      },
+  )
+  instance = resp.json()
+  print(instance["id"], instance["status"])
+  ```
+
+  ```javascript node theme={null}
+  const res = await fetch("https://api.agent37.com/v1/instances", {
+    method: "POST",
+    headers: {
+      Authorization: "Bearer sk_live_...",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      template: "agent37-hermes",
+      user: "u_882",
+      budget: { credit_micros: 1000000 },
+    }),
+  });
+  const instance = await res.json();
+  ```
+
+  ```json response theme={null}
+  {
+    "id": "ab12cd34ef",
+    "status": "running",
+    "template": "agent37-hermes",
+    "image_ref": "ghcr.io/agent37-platform/hermes:2026.06.14",
+    "resources": { "cpu": 2, "memory": 4, "disk": 6 },
+    "ports": [
+      { "port": 3737, "default": true, "url": "https://ab12cd34ef.agent37.app" },
+      { "port": 9119, "default": false, "url": "https://ab12cd34ef-9119.agent37.app" },
+      { "port": 7681, "default": false, "url": "https://ab12cd34ef-7681.agent37.app" },
+      { "port": 8080, "default": false, "url": "https://ab12cd34ef-8080.agent37.app" }
+    ],
+    "user": "u_882",
+    "name": null,
+    "metadata": null,
+    "paid_through": 1781308800,
+    "past_due": false,
+    "created": 1781222400
+  }
+  ```
+</CodeGroup>
+
+## The instance object
+
+<ResponseField name="id" type="string">
+  A bare 10-character lowercase alphanumeric id, no prefix. It doubles as the DNS label in the instance's URL.
+</ResponseField>
+
+<ResponseField name="status" type="string">
+  The lifecycle state. `running` means the instance's computer is up; poll `GET /v1/health` before the first message. See the [statuses table](#statuses) below.
+</ResponseField>
+
+<ResponseField name="template" type="string">
+  The template the instance was built from.
+</ResponseField>
+
+<ResponseField name="image_ref" type="string">
+  The exact image the instance is running.
+</ResponseField>
+
+<ResponseField name="resources" type="object">
+  The shape: `cpu` (vCPUs), `memory` and `disk` (GB).
+</ResponseField>
+
+<ResponseField name="ports" type="object[]">
+  The instance's routed ports, each `{ port, default, url }`. The default port's URL uses the instance id (`https://ab12cd34ef.agent37.app`, where the agent's chat API lives); every other port gets a **preview URL**, `https://{instanceId}-{port}.agent37.app`. Open any of them in a browser with a [signed URL](/docs/agents-api/urls#browser-access-with-signed-urls). See [Instance and preview URLs](/docs/agents-api/urls) for the routing scheme.
+</ResponseField>
+
+<ResponseField name="user" type="string | null">
+  Your attribution tag, echoed back.
+</ResponseField>
+
+<ResponseField name="name" type="string | null">
+  Your label, echoed back.
+</ResponseField>
+
+<ResponseField name="metadata" type="object | null">
+  Your key/value pairs, echoed back.
+</ResponseField>
+
+<ResponseField name="paid_through" type="integer | null">
+  When the prepaid compute day ends, in epoch seconds. The next renewal debits at this time.
+</ResponseField>
+
+<ResponseField name="past_due" type="boolean">
+  `true` when a renewal could not be covered and the instance was force-stopped. A funded `start` re-debits a day and clears it.
+</ResponseField>
+
+<ResponseField name="created" type="integer">
+  Creation time in epoch seconds.
+</ResponseField>
+
+## Endpoints
+
+| Method   | Path                         | Returns                                                                |
+| -------- | ---------------------------- | ---------------------------------------------------------------------- |
+| `POST`   | `/v1/instances`              | `201` with the full instance object                                    |
+| `GET`    | `/v1/instances`              | `200` `{ "data": [...] }`, newest first, each the full instance object |
+| `GET`    | `/v1/instances/{id}`         | `200` with the full instance object                                    |
+| `PATCH`  | `/v1/instances/{id}`         | `200` with the full instance object                                    |
+| `DELETE` | `/v1/instances/{id}`         | `200` `{ "id": "...", "deleted": true }`                               |
+| `POST`   | `/v1/instances/{id}/stop`    | `200` `{ id, status }` ack                                             |
+| `POST`   | `/v1/instances/{id}/start`   | `200` `{ id, status }` ack                                             |
+| `POST`   | `/v1/instances/{id}/restart` | `200` `{ id, status }` ack                                             |
+| `POST`   | `/v1/instances/{id}/update`  | `200` `{ id, status, image_ref }` ack                                  |
+| `POST`   | `/v1/instances/{id}/resize`  | `200` `{ id, status, resources }` ack                                  |
+
+## List, get, delete
+
+`GET /v1/instances` returns `{ "data": [ ... ] }`, newest first, each element the full instance object. `GET /v1/instances/{id}` returns one. Unknown, deleted, or other-workspace ids uniformly return `404 not_found`.
+
+`DELETE /v1/instances/{id}` returns `{ "id": "ab12cd34ef", "deleted": true }`. It acts once: a repeat delete returns `404`. Billing stops at delete, and the unused remainder of the prepaid day is refunded to your wallet, prorated to the exact time used (a minimum of one hour is billed).
+
+```bash curl theme={null}
+curl -X DELETE https://api.agent37.com/v1/instances/ab12cd34ef \
+  -H "Authorization: Bearer sk_live_..."
+# -> { "id": "ab12cd34ef", "deleted": true }
+```
+
+<Warning>
+  Delete is destructive: the instance's files, memory, and sessions are gone. To pause work while keeping everything, `stop` it instead. A stopped instance still bills compute, because it still exists; delete is what stops billing.
+</Warning>
+
+## Edit name, tag, and metadata
+
+`PATCH /v1/instances/{id}` edits the instance's `name`, `user` tag, and `metadata` after creation. These are the same three fields you can set at create, and they are the only things this call changes: it never touches the running container. It returns `200` with the full instance object, the same shape as `GET`.
+
+The patch is partial: only the keys you send change, the rest are left alone. Send a string to set a field, or `null` (or `""`) to clear it. You must send at least one of `name`, `user`, or `metadata`; an empty body returns `400 invalid_request`.
+
+<ParamField type="string | null">
+  A label for the instance, up to 60 characters. `null` or `""` clears it.
+</ParamField>
+
+<ParamField type="string | null">
+  Your attribution tag, up to 200 characters. `null` or `""` clears it.
+</ParamField>
+
+<ParamField type="object | null">
+  Your key/value pairs, up to 4 KB serialized. The object replaces the stored one, it is not merged. `null` or `{}` clears it.
+</ParamField>
+
+Editing labels never bills and never recreates the container, and it works in any state except `deleted`. Unknown, deleted, or other-workspace ids return `404 not_found`.
+
+<CodeGroup>
+  ```bash curl theme={null}
+  curl -X PATCH https://api.agent37.com/v1/instances/ab12cd34ef \
+    -H "Authorization: Bearer sk_live_..." \
+    -H "Content-Type: application/json" \
+    -d '{ "name": "Production agent", "user": "u_882", "metadata": { "plan": "pro" } }'
+  ```
+
+  ```python python theme={null}
+  import requests
+
+  resp = requests.patch(
+      "https://api.agent37.com/v1/instances/ab12cd34ef",
+      headers={"Authorization": "Bearer sk_live_..."},
+      json={"name": "Production agent", "user": "u_882", "metadata": {"plan": "pro"}},
+  )
+  instance = resp.json()
+  ```
+
+  ```javascript node theme={null}
+  const res = await fetch("https://api.agent37.com/v1/instances/ab12cd34ef", {
+    method: "PATCH",
+    headers: {
+      Authorization: "Bearer sk_live_...",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      name: "Production agent",
+      user: "u_882",
+      metadata: { plan: "pro" },
+    }),
+  });
+  const instance = await res.json();
+  ```
+
+  ```json response theme={null}
+  {
+    "id": "ab12cd34ef",
+    "status": "running",
+    "template": "agent37-hermes",
+    "image_ref": "ghcr.io/agent37-platform/hermes:2026.06.14",
+    "resources": { "cpu": 2, "memory": 4, "disk": 6 },
+    "ports": [
+      { "port": 3737, "default": true, "url": "https://ab12cd34ef.agent37.app" },
+      { "port": 9119, "default": false, "url": "https://ab12cd34ef-9119.agent37.app" },
+      { "port": 7681, "default": false, "url": "https://ab12cd34ef-7681.agent37.app" },
+      { "port": 8080, "default": false, "url": "https://ab12cd34ef-8080.agent37.app" }
+    ],
+    "user": "u_882",
+    "name": "Production agent",
+    "metadata": { "plan": "pro" },
+    "paid_through": 1781308800,
+    "past_due": false,
+    "created": 1781222400
+  }
+  ```
+</CodeGroup>
+
+## Lifecycle
+
+Five calls control whether the instance's computer is running, which image it runs, and how big it is. Each is a `POST` to a subpath; `stop`, `start`, and `restart` take no body, `update` rejects one, and `resize` takes the new size. They acknowledge the new state only, returning `{ id, status }` (`update` adds `image_ref`, `resize` adds `resources`); `GET` the instance for its full representation. Everything on the instance (files, memory, connected accounts) survives them.
+
+### Stop
+
+`POST /v1/instances/{id}/stop` halts the container. The agent stops doing work (no cron, no heartbeats, no responses) and `status` becomes `stopped`. The data stays intact, CPU and memory are released back to the host, and the disk stays reserved on that host. Stopping an already stopped instance returns the same ack again; any other state returns `400`.
+
+```bash curl theme={null}
+curl -X POST https://api.agent37.com/v1/instances/ab12cd34ef/stop \
+  -H "Authorization: Bearer sk_live_..."
+# -> { "id": "ab12cd34ef", "status": "stopped" }
+```
+
+### Start
+
+`POST /v1/instances/{id}/start` brings a `stopped` instance back up on its pinned host, recreating the container from the image it already ran. If the host no longer has room for the instance's CPU and memory, it returns `409 capacity_unavailable`. If the instance is `past_due`, start first re-debits a day and clears the flag; without funds it returns `402 insufficient_balance`. Starting an already running instance returns the same ack again.
+
+```bash curl theme={null}
+curl -X POST https://api.agent37.com/v1/instances/ab12cd34ef/start \
+  -H "Authorization: Bearer sk_live_..."
+# -> { "id": "ab12cd34ef", "status": "running" }
+```
+
+### Restart
+
+`POST /v1/instances/{id}/restart` recreates the container from the image already on the host (no download) and returns it to `running`. Use it to recover a wedged agent or pick up changed settings. Same image, same data. The instance must be `running`; use `start` to bring a `stopped` one back up.
+
+```bash curl theme={null}
+curl -X POST https://api.agent37.com/v1/instances/ab12cd34ef/restart \
+  -H "Authorization: Bearer sk_live_..."
+# -> { "id": "ab12cd34ef", "status": "running" }
+```
+
+### Update
+
+`POST /v1/instances/{id}/update` pulls the template's current image and preserves the data. Use it to move an instance onto a newer version after you point its template at a new tag, or to recover a failed/stuck instance. A `running` or recoverable non-stopped instance is recreated and returns `running`; a `stopped` instance pulls the image pointer now and stays `stopped`, then uses that image the next time it starts. The request must have no body (a body with any fields returns `400`; an empty `{}` is accepted). The ack carries the resulting `status` and new `image_ref`. A bad image reference on the template surfaces here as a `502 provisioning_failed`.
+
+```bash curl theme={null}
+curl -X POST https://api.agent37.com/v1/instances/ab12cd34ef/update \
+  -H "Authorization: Bearer sk_live_..."
+# -> { "id": "ab12cd34ef", "status": "running", "image_ref": "ghcr.io/acme/my-agent:v1" }
+```
+
+### Resize
+
+`POST /v1/instances/{id}/resize` grows a running instance to a bigger size. The body uses the same vocabulary as create's `resources`, and omitted fields keep their current value, so `{ "disk": 15 }` grows disk alone and `{ "cpu": 4, "memory": 8 }` moves up a shape (disk rises to the new shape's minimum if it was below it). Resize only grows: any request that would shrink a dimension returns `400`, and moving to a smaller size means creating a new instance. The ack carries the new `resources`, and the new rate applies from the next hourly renewal. If you run more than one instance, a resize re-checks the 30-days-of-fleet balance rule at the new size and returns `402 insufficient_balance` when the balance falls short (see [Billing](/docs/agents-api/billing)).
+
+The container is recreated with the new limits, like `restart`: the disk, instance id, and URLs are kept, in-memory state is lost, and the instance is back in seconds. If its host cannot fit the increase, nothing changes and you get `409 capacity_unavailable`.
+
+```bash curl theme={null}
+curl -X POST https://api.agent37.com/v1/instances/ab12cd34ef/resize \
+  -H "Authorization: Bearer sk_live_..." \
+  -H "Content-Type: application/json" \
+  -d '{ "cpu": 4, "memory": 8 }'
+# -> { "id": "ab12cd34ef", "status": "running", "resources": { "cpu": 4, "memory": 8, "disk": 20 } }
+```
+
+## Statuses
+
+| Status         | Meaning                                                            |
+| -------------- | ------------------------------------------------------------------ |
+| `provisioning` | Being created. You only observe this if a create is in flight.     |
+| `running`      | Up. Poll `GET /v1/health` before the first message.                |
+| `stopping`     | A stop is in progress.                                             |
+| `stopped`      | Halted. Data intact, disk reserved, compute released. Still bills. |
+| `starting`     | A start is in progress.                                            |
+| `restarting`   | A restart is in progress.                                          |
+| `updating`     | An update or resize is in progress.                                |
+| `failed`       | A create or lifecycle action failed.                               |
+| `deleting`     | A delete is in progress.                                           |
+| `deleted`      | Gone. The id reads as `404` from here on.                          |
+
+<Note>
+  `past_due` is a flag, not a status. A past-due instance shows `status: "stopped"` with `past_due: true`; a funded `start` clears it.
+</Note>
+
+## Capacity and limit errors
+
+| Error                        | When                                                                                                                                                                                         |
+| ---------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `402 insufficient_balance`   | Create when the wallet cannot cover the first day, create or resize beyond one instance when the balance does not hold 30 days for the fleet, or start of a past-due instance without funds. |
+| `409 instance_limit_reached` | Create when the workspace is at its instance cap: one instance on the free credit, 10 once topped up (contact support to raise it).                                                          |
+| `403 tier_limit`             | Create or resize asks for a shape larger than your plan includes. Free workspaces run any template up to the 2 vCPU / 4 GB shape; a top-up unlocks the 4/8 and 8/16 shapes.                  |
+| `503 no_capacity`            | Create when no host has capacity for the requested shape right now.                                                                                                                          |
+| `409 capacity_unavailable`   | Start when the pinned host cannot re-reserve the instance's compute, or resize when it cannot fit the increase.                                                                              |
+
+See [Errors](/docs/agents-api/errors) for the full catalog and the error envelope.
+
+
+# Sessions & models
+Source: https://agent37.com/docs/agents-api/sessions
+
+List, read, and delete conversations on an instance, and see which models its agent can run.
+
+A session is one conversation on an instance. An instance holds many sessions, one per thread, and each session keeps its own full history, so you only ever send the new input. These endpoints are served by the gateway running inside the instance.
+
+Everything on this page lives on the instance URL, not the hosting API: the base is `https://{instanceId}.agent37.app`, with the same `Authorization: Bearer sk_live_...` header. The platform edge authenticates the key and checks the instance belongs to your workspace, then the gateway answers. See [Instance and preview URLs](/docs/agents-api/urls).
+
+## Endpoints
+
+| Method   | Path                | Returns                                                                    |
+| -------- | ------------------- | -------------------------------------------------------------------------- |
+| `GET`    | `/v1/sessions`      | `200` `{ "data": [...] }`, newest first, each the session object           |
+| `GET`    | `/v1/sessions/{id}` | `200` the session object with its full `history`                           |
+| `DELETE` | `/v1/sessions/{id}` | `200` `{ "id": "...", "deleted": true }`                                   |
+| `GET`    | `/v1/models`        | `200` `{ default_model, default_provider, data }`                          |
+| `GET`    | `/v1/health`        | `200` `{ "ok": true, "agent": "hermes", "healthy": true, "hermes": true }` |
+| `GET`    | `/v1/version`       | `200` `{ name, version }`                                                  |
+
+<Note>
+  You never create a session directly. The first [`POST /v1/responses`](/docs/agents-api/chat) without a `session_id` mints one and returns its id; reuse that id to continue the thread.
+</Note>
+
+## The session object
+
+<ResponseField name="id" type="string">
+  The session id: 32 hex characters, no prefix. Every response in the conversation carries it as `session_id`.
+</ResponseField>
+
+<ResponseField name="agent" type="string">
+  The agent the session runs, `hermes` or `openclaw`.
+</ResponseField>
+
+<ResponseField name="model" type="string | null">
+  The session's current model. Sending `model` on a turn updates it; `null` until a turn sets one.
+</ResponseField>
+
+<ResponseField name="provider" type="string | null">
+  The current model's provider, e.g. `anthropic`.
+</ResponseField>
+
+<ResponseField name="created" type="number">
+  When the session started, in epoch milliseconds.
+</ResponseField>
+
+<ResponseField name="last_response_at" type="number | null">
+  When the last turn finished, in epoch milliseconds. Failed turns do not update it; `null` until the first turn completes.
+</ResponseField>
+
+## List sessions
+
+`GET /v1/sessions` returns every session on the instance, newest first, wrapped in `{ "data": [...] }`. Pass `?agent=hermes` or `?agent=openclaw` to return only that agent's sessions; an unknown agent is a `400`. The list carries session metadata only, never history, so it stays cheap to poll for a sidebar.
+
+<CodeGroup>
+  ```bash curl theme={null}
+  curl https://ab12cd34ef.agent37.app/v1/sessions \
+    -H "Authorization: Bearer sk_live_..."
+  ```
+
+  ```python python theme={null}
+  import requests
+
+  sessions = requests.get(
+      "https://ab12cd34ef.agent37.app/v1/sessions",
+      headers={"Authorization": "Bearer sk_live_..."},
+  ).json()["data"]
+  ```
+
+  ```javascript node theme={null}
+  const { data: sessions } = await (await fetch(
+    "https://ab12cd34ef.agent37.app/v1/sessions",
+    { headers: { Authorization: "Bearer sk_live_..." } },
+  )).json();
+  ```
+
+  ```json response theme={null}
+  {
+    "data": [
+      {
+        "id": "7f3e0b6c52a949d2b1c4a8e9d0f31726",
+        "agent": "hermes",
+        "model": "claude-sonnet-4-5",
+        "provider": "anthropic",
+        "created": 1781049600000,
+        "last_response_at": 1781049642000
+      }
+    ]
+  }
+  ```
+</CodeGroup>
+
+## Retrieve a session with history
+
+`GET /v1/sessions/{id}` returns the session object plus `history`: the full transcript, in order. You read it for display or audit; you never resend it, because the session already holds it. A session with `last_response_at: null` (no turn has finished yet) returns `history: []`. An unknown id returns `404 session_not_found`.
+
+Each entry in `history` is a message:
+
+<ResponseField name="id" type="string">
+  The message id. Treat it as opaque; it uses a different format from session and response ids.
+</ResponseField>
+
+<ResponseField name="session_id" type="string">
+  The session the message belongs to.
+</ResponseField>
+
+<ResponseField name="role" type="string">
+  `user`, `assistant`, or `system`.
+</ResponseField>
+
+<ResponseField name="content" type="string">
+  The message text.
+</ResponseField>
+
+<ResponseField name="thinking" type="string">
+  The assistant's reasoning for that turn, when the agent recorded any. Absent otherwise.
+</ResponseField>
+
+<ResponseField name="created_at" type="number">
+  When the message was created, in epoch milliseconds.
+</ResponseField>
+
+<CodeGroup>
+  ```bash curl theme={null}
+  curl https://ab12cd34ef.agent37.app/v1/sessions/7f3e0b6c52a949d2b1c4a8e9d0f31726 \
+    -H "Authorization: Bearer sk_live_..."
+  ```
+
+  ```json response theme={null}
+  {
+    "id": "7f3e0b6c52a949d2b1c4a8e9d0f31726",
+    "agent": "hermes",
+    "model": "claude-sonnet-4-5",
+    "provider": "anthropic",
+    "created": 1781049600000,
+    "last_response_at": 1781049642000,
+    "history": [
+      {
+        "id": "hermes:7f3e0b6c52a949d2b1c4a8e9d0f31726:1",
+        "session_id": "7f3e0b6c52a949d2b1c4a8e9d0f31726",
+        "role": "user",
+        "content": "Research the top 3 EV makers, write a memo.",
+        "created_at": 1781049601000
+      },
+      {
+        "id": "hermes:7f3e0b6c52a949d2b1c4a8e9d0f31726:2",
+        "session_id": "7f3e0b6c52a949d2b1c4a8e9d0f31726",
+        "role": "assistant",
+        "content": "Here is the memo...",
+        "thinking": "Comparing deliveries, margins, and charging networks...",
+        "created_at": 1781049642000
+      }
+    ]
+  }
+  ```
+</CodeGroup>
+
+## Delete a session
+
+`DELETE /v1/sessions/{id}` removes the conversation and returns exactly `{ "id": "...", "deleted": true }`. The delete acts once: repeating it returns `404 session_not_found`.
+
+<CodeGroup>
+  ```bash curl theme={null}
+  curl -X DELETE https://ab12cd34ef.agent37.app/v1/sessions/7f3e0b6c52a949d2b1c4a8e9d0f31726 \
+    -H "Authorization: Bearer sk_live_..."
+  ```
+
+  ```json response theme={null}
+  { "id": "7f3e0b6c52a949d2b1c4a8e9d0f31726", "deleted": true }
+  ```
+</CodeGroup>
+
+<Warning>
+  Deleting a session is permanent. It removes the conversation, its history, and the stored response objects for its turns — `GET /v1/responses/{id}` for those turns returns `404 response_not_found` afterwards — but leaves the instance (its files, memory, and connected accounts) untouched.
+</Warning>
+
+## One turn at a time
+
+A session runs one response at a time. Posting new input while a turn is in flight returns `409 session_busy`. Cancel the running turn with [`POST /v1/responses/{id}/cancel`](/docs/agents-api/chat), or start the new input on another session. Two sessions on the same instance run independently.
+
+## List models
+
+`GET /v1/models` lists the models the instance's agent can run. The result is cached for about 60 seconds, so a newly available model can take up to a minute to appear.
+
+<ResponseField name="default_model" type="string | null">
+  The model used when a turn does not name one.
+</ResponseField>
+
+<ResponseField name="default_provider" type="string | null">
+  The provider of the default model.
+</ResponseField>
+
+<ResponseField name="data" type="array">
+  One entry per model: `{ "id", "label", "provider", "is_default" }`. Pass an entry's `id` as `model` (with its `provider`) on a turn.
+</ResponseField>
+
+<CodeGroup>
+  ```bash curl theme={null}
+  curl https://ab12cd34ef.agent37.app/v1/models \
+    -H "Authorization: Bearer sk_live_..."
+  ```
+
+  ```python python theme={null}
+  import requests
+
+  models = requests.get(
+      "https://ab12cd34ef.agent37.app/v1/models",
+      headers={"Authorization": "Bearer sk_live_..."},
+  ).json()
+  ```
+
+  ```javascript node theme={null}
+  const models = await (await fetch(
+    "https://ab12cd34ef.agent37.app/v1/models",
+    { headers: { Authorization: "Bearer sk_live_..." } },
+  )).json();
+  ```
+
+  ```json response theme={null}
+  {
+    "default_model": "claude-sonnet-4-5",
+    "default_provider": "anthropic",
+    "data": [
+      { "id": "claude-sonnet-4-5", "label": "Claude Sonnet 4.5", "provider": "anthropic", "is_default": true },
+      { "id": "gpt-5.2", "label": "GPT-5.2", "provider": "openai", "is_default": false }
+    ]
+  }
+  ```
+</CodeGroup>
+
+`model` and `provider` are dials you set per turn on [`POST /v1/responses`](/docs/agents-api/chat): omit them to keep the session's current model, or send them to switch. A continuation that sets them updates the session's stored model and provider for the turns that follow.
+
+## Health and version
+
+`GET /v1/health` returns `{ "ok": true, "agent": "hermes", "healthy": true, "hermes": true }`. `ok` is true whenever the gateway is up; `agent` is the instance's agent (`hermes` or `openclaw`), and `healthy` reports whether that agent behind it is reachable. Hermes instances also return a `hermes` field mirroring `healthy`, kept for backward compatibility; an `openclaw` instance returns the same body without the `hermes` field. Use it as a readiness probe after [create or start](/docs/agents-api/instances).
+
+`GET /v1/version` returns the gateway build, e.g. `{ "name": "agent37-gateway", "version": "0.1.3" }`.
+
+
+# Streaming
+Source: https://agent37.com/docs/agents-api/streaming
+
+Stream a reply as named Server-Sent Events from your instance URL, and reconnect without losing the answer.
+
+Send `stream: true` on [a message](/docs/agents-api/chat) and the reply comes back as Server-Sent Events. Each event is named, so you can render text, reasoning, and tool activity live. Events arrive in order, and the terminal `response.completed` event carries the final `output_text` and `usage`.
+
+The base URL is your instance URL: `https://{instanceId}.agent37.app`, with the same `sk_live_` Bearer on every request. This page documents the gateway's streaming contract, the API every instance serves.
+
+## Start a stream
+
+```bash curl theme={null}
+curl -N https://ab12cd34ef.agent37.app/v1/responses \
+  -H "Authorization: Bearer sk_live_..." \
+  -H "Content-Type: application/json" \
+  -d '{
+    "input": "Research the top 3 EV makers, write a memo.",
+    "stream": true
+  }'
+```
+
+The connection stays open and frames arrive as `event:` plus `data:` pairs separated by a blank line:
+
+```text stream theme={null}
+event: response.created
+data: {"id":"c91d2a7e84f04b6f9a3d5e1c0b87f4a2","session_id":"7f3e0b6c52a949d2b1c4a8e9d0f31726"}
+
+event: response.reasoning.delta
+data: {"text":"Comparing deliveries and margins across the big three..."}
+
+event: response.tool_call.started
+data: {"tool":"web_search","label":"EV deliveries 2025"}
+
+event: response.tool_call.completed
+data: {"tool":"web_search","duration_ms":1840}
+
+event: response.output_text.delta
+data: {"text":"## EV market memo\n\n"}
+
+:keepalive
+
+event: response.completed
+data: {"output_text":"## EV market memo\n\n...","usage":{"input_tokens":1840,"output_tokens":920,"cost_usd":0.0137}}
+```
+
+## Events
+
+There are exactly eight event types:
+
+| Event                          | Payload                                                                                                                         |
+| ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------- |
+| `response.created`             | `{ id, session_id }`, always first; the response id and the session it runs in                                                  |
+| `response.reasoning.delta`     | `{ text }`, a chunk of the agent's thinking                                                                                     |
+| `response.output_text.delta`   | `{ text }`, a chunk of the visible answer                                                                                       |
+| `response.tool_call.started`   | `{ tool, label? }`                                                                                                              |
+| `response.tool_call.completed` | `{ tool, duration_ms? }`                                                                                                        |
+| `response.tool_call.failed`    | `{ tool, error? }`, the run continues                                                                                           |
+| `response.completed`           | `{ output_text, usage }`, terminal; `usage` can be `null`, and `cost_usd` inside it is `null` when the provider reports no cost |
+| `response.failed`              | `{ error: { code, message, param?, hint? } }`, terminal                                                                         |
+
+<Info>
+  These event names and payloads are the gateway's streaming contract, not a per-agent detail. Hermes and OpenClaw emit them today, and the agents that follow will emit the same eight, so your client code does not change when you switch templates.
+</Info>
+
+Rules the stream always follows:
+
+* `response.created` is always first, and exactly one terminal event (`response.completed` or `response.failed`) ends every live stream.
+* Every 30 seconds the gateway writes the comment line `:keepalive`, whether or not events are flowing. Comments are not events: ignore any line starting with `:`.
+* There is no `[DONE]` sentinel. The server closes the connection right after the terminal event; terminal event plus close is end of stream.
+* Once streaming starts, failures arrive as a `response.failed` event with the standard error body, never as an HTTP error status.
+
+<Note>
+  A cancelled turn (`POST /v1/responses/{id}/cancel`) still ends with `response.completed`, carrying whatever `output_text` accumulated before the cancel. Only failures emit `response.failed`. The stored response's `status` is `cancelled`.
+</Note>
+
+## Reconnect after a drop
+
+```text theme={null}
+GET /v1/responses/{id}/stream
+```
+
+If your connection drops mid-turn, reconnect with the response id from `response.created`:
+
+```bash curl theme={null}
+curl -N https://ab12cd34ef.agent37.app/v1/responses/c91d2a7e84f04b6f9a3d5e1c0b87f4a2/stream \
+  -H "Authorization: Bearer sk_live_..."
+```
+
+While the run is live, the gateway replays the entire ordered event buffer from `response.created` onward, then stays attached for the rest of the run. If the run just finished, it replays the buffer and ends. The buffer holds up to 100,000 events per run; the rare run that exceeds it stops buffering, so a reconnect replays the first 100,000 events and may end without the terminal event. The finished turn — terminal event and all — is always available from `GET /v1/responses/{id}`.
+
+<Note>
+  **The answer is never lost.** Reconnect any time and you get the final `output_text`, even after the turn is over. One caveat: about 60 seconds after a turn finishes, the in-memory buffer expires and the replay is synthesized from storage as `response.created`, one `response.output_text.delta` carrying the full text (omitted when the turn produced none), then the terminal event. Reasoning and tool-call events from the original run are not preserved in that synthesized replay.
+</Note>
+
+## Parse the stream
+
+No SSE library needed. Read the response body, split on the blank-line frame boundary, skip comment lines, and branch on each frame's `event:` line. Stop when the connection closes after a terminal event.
+
+```javascript node theme={null}
+const res = await fetch("https://ab12cd34ef.agent37.app/v1/responses", {
+  method: "POST",
+  headers: {
+    Authorization: "Bearer sk_live_...",
+    "Content-Type": "application/json",
+  },
+  body: JSON.stringify({
+    input: "Research the top 3 EV makers, write a memo.",
+    stream: true,
+  }),
+});
+
+const reader = res.body.getReader();
+const decoder = new TextDecoder();
+let buffer = "";
+
+while (true) {
+  const { value, done } = await reader.read();
+  if (done) break;
+  buffer += decoder.decode(value, { stream: true });
+
+  // SSE frames are separated by a blank line
+  const frames = buffer.split("\n\n");
+  buffer = frames.pop(); // keep the trailing partial frame
+
+  for (const frame of frames) {
+    if (frame.startsWith(":")) continue; // comment line, e.g. :keepalive
+
+    const event = frame.match(/^event: (.+)$/m)?.[1];
+    const data = JSON.parse(frame.match(/^data: (.+)$/m)?.[1] ?? "{}");
+
+    switch (event) {
+      case "response.output_text.delta":
+        process.stdout.write(data.text); // stream the answer
+        break;
+      case "response.reasoning.delta":
+        // show the agent thinking, if you want
+        break;
+      case "response.tool_call.started":
+        console.log(`\n[${data.tool}] ${data.label ?? ""}`);
+        break;
+      case "response.completed":
+        console.log("\nusage:", data.usage);
+        break;
+      case "response.failed":
+        console.error("\nerror:", data.error);
+        break;
+    }
+  }
+}
+```
+
+<Note>
+  The browser's built-in `EventSource` cannot send a POST body or an `Authorization` header, so it cannot start a stream here. Use `fetch` as above, in the browser and in Node. The [hermes-chat example](https://github.com/agent37-platform/examples/tree/main/hermes-chat) runs a browser version of this parser in a real chat UI (`public/chat.js`), with reconnect and cancel wired in.
+</Note>
+
+<Tip>
+  Prefer not to stream? Send `stream: false` (the default) and the call returns the finished response as one JSON body, with the agent's reply in `output_text`.
+</Tip>
+
+
+# Templates
+Source: https://agent37.com/docs/agents-api/templates
+
+Name an image and the ports it serves once, then create every instance from that name.
+
+A template is a named image plus the ports it serves. Instances are always created from template names: pass `template` on [`POST /v1/instances`](/docs/agents-api/instances), or omit it for the default `agent37-hermes`. Direct image references are rejected with `400 invalid_request`; register a template first, then pass its name.
+
+```bash curl theme={null}
+curl -X POST https://api.agent37.com/v1/instances \
+  -H "Authorization: Bearer sk_live_..." \
+  -H "Content-Type: application/json" \
+  -d '{ "template": "agent37-hermes" }'
+```
+
+Templates come in two scopes. `system` templates are the built-in catalog, the same for every workspace and read-only. `workspace` templates are ones you register from your own public image, visible only to your workspace.
+
+## System catalog
+
+The `agent37-` prefix is reserved for system templates. The catalog has three entries today:
+
+| Template               | What it runs                                                         | Ports                                     |
+| ---------------------- | -------------------------------------------------------------------- | ----------------------------------------- |
+| `agent37-hermes`       | Hermes, the general agent: chat, browsing, code, files. The default. | `3737` (default), `9119`, `7681`, `8080`  |
+| `agent37-hermes-small` | Hermes, lean: chat, code, files, shell. No browser or desktop.       | `3737` (default), `9119`, `7681`, `8080`  |
+| `agent37-openclaw`     | OpenClaw, the general agent: chat, headless browsing, code, files.   | `3737` (default), `18789`, `7681`, `8080` |
+
+`agent37-hermes-small` is the only template that can run on the sub-floor 1 vCPU / 3 GB shape, from \$3.44 per month; see [sizing](/docs/agents-api/instances). Standard and custom templates start at 2 vCPU / 4 GB.
+
+<Note>
+  More system templates (Claude Code, Codex) are coming; they will appear in `GET /v1/templates` when they are available. Passing any other `agent37-` name on instance create returns `400 invalid_request`, because the prefix is reserved.
+</Note>
+
+On `agent37-hermes`, port `3737` is the gateway: the [chat API](/docs/agents-api/chat) at `https://{instanceId}.agent37.app`. Every declared port becomes an authenticated URL on the instance object after create; see [Instance and preview URLs](/docs/agents-api/urls).
+
+## Endpoints
+
+| Method   | Path                   | Returns                                                                                       |
+| -------- | ---------------------- | --------------------------------------------------------------------------------------------- |
+| `GET`    | `/v1/templates`        | `200` `{ "data": [...] }`, system catalog first, then your workspace templates sorted by name |
+| `POST`   | `/v1/templates`        | `201` with the new workspace template                                                         |
+| `GET`    | `/v1/templates/{name}` | `200` with one template, system or workspace                                                  |
+| `PATCH`  | `/v1/templates/{name}` | `200` with the updated workspace template                                                     |
+| `DELETE` | `/v1/templates/{name}` | `200` `{ "name": "...", "deleted": true }`                                                    |
+
+```bash curl theme={null}
+curl https://api.agent37.com/v1/templates \
+  -H "Authorization: Bearer sk_live_..."
+```
+
+## Register a workspace template
+
+`POST /v1/templates` registers a public amd64 image under a name you choose. The platform runs it as a managed instance with the same lifecycle, billing, [exec](/docs/agents-api/exec), and routed port URLs as the catalog; what the image serves on its ports is up to it. The image can be anything public, built from scratch or on [the Hermes base image](#build-on-the-hermes-base-image). If you need a private registry, a larger image than the 5 GB cap allows, or don't want your image public, [talk to the team](https://cal.com/vishnukool/30min).
+
+<ParamField type="string">
+  2 to 63 characters: lowercase letters, digits, and hyphens, starting with a letter (`^[a-z][a-z0-9-]{1,62}$`). The `agent37-` prefix is reserved. A name that already exists returns `409 template_conflict`.
+</ParamField>
+
+<ParamField type="string">
+  A fully qualified public image reference with a registry or namespace path, like `ghcr.io/acme/my-agent:v1`. Up to 255 characters. The image must be public, built for `linux/amd64`, and at most 5 GB compressed. The platform verifies all three against the registry manifest when you register or update the template and again whenever it pulls the image, so a tag repointed at something oversized or private is rejected at that point too. Need a bigger image? [Talk to the team](https://cal.com/vishnukool/30min) about raising the cap.
+</ParamField>
+
+<ParamField type="string">
+  Optional free-text description.
+</ParamField>
+
+<ParamField type="array">
+  The ports the image serves, each `{ "port": <int>, "default": <bool> }`. At most 20 entries; ports are integers 1 to 65535; no duplicates; at most one entry may set `default: true`. Each non-default port gets a **preview URL**, `https://{instanceId}-{port}.agent37.app`, openable in a browser with a [signed URL](/docs/agents-api/urls#browser-access-with-signed-urls). The reserved set `3737`, `7681`, `8080`, `6080`, `7890`, `6969`, `9119` is rejected: those belong to the managed runtime. Omit `ports` or pass `[]` for a private sandbox with no routable URL; you can still reach it with [exec](/docs/agents-api/exec).
+</ParamField>
+
+<CodeGroup>
+  ```bash curl theme={null}
+  curl -X POST https://api.agent37.com/v1/templates \
+    -H "Authorization: Bearer sk_live_..." \
+    -H "Content-Type: application/json" \
+    -d '{
+      "name": "my-agent",
+      "image_ref": "ghcr.io/acme/my-agent:v1",
+      "description": "My agent",
+      "ports": [{ "port": 8000, "default": true }]
+    }'
+  ```
+
+  ```python python theme={null}
+  import requests
+
+  resp = requests.post(
+      "https://api.agent37.com/v1/templates",
+      headers={"Authorization": "Bearer sk_live_..."},
+      json={
+          "name": "my-agent",
+          "image_ref": "ghcr.io/acme/my-agent:v1",
+          "description": "My agent",
+          "ports": [{"port": 8000, "default": True}],
+      },
+  )
+  print(resp.json())
+  ```
+
+  ```javascript node theme={null}
+  const resp = await fetch("https://api.agent37.com/v1/templates", {
+    method: "POST",
+    headers: {
+      Authorization: "Bearer sk_live_...",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      name: "my-agent",
+      image_ref: "ghcr.io/acme/my-agent:v1",
+      description: "My agent",
+      ports: [{ port: 8000, default: true }],
+    }),
+  });
+  console.log(await resp.json());
+  ```
+</CodeGroup>
+
+Registration validates the reference's shape and stores the template. The image is pulled lazily, the first time you create or update an instance from the template. A bad reference surfaces there as a failed create: the create returns `502 provisioning_failed` and the prepaid day is refunded in full.
+
+<Tip>
+  Pin a tag on `image_ref`; do not rely on `latest`. A pinned tag makes rollback a one-field `PATCH` and keeps every instance you create reproducible.
+</Tip>
+
+<Note>
+  Build for `linux/amd64` even on an Apple Silicon Mac (`docker build --platform=linux/amd64 ...`). Instances run on amd64, and an arm64 image will fail to start.
+</Note>
+
+## Build on the Hermes base image
+
+`ghcr.io/agent37-platform/hermes-base` is the published FROM target for custom templates. It ships Hermes with its browser stack (Chromium, Playwright), the gateway that serves the [chat API](/docs/agents-api/chat), and a general toolchain: git, Python 3 with uv, Node.js, build tools. There are no platform LLM credentials and no managed search or Composio integrations; you add your layers on top and bring your own model keys.
+
+```dockerfile theme={null}
+FROM ghcr.io/agent37-platform/hermes-base:2026.06.14
+
+USER root
+RUN apt-get update && apt-get install -y postgresql-client
+COPY my-skills/ /usr/local/share/agent37/default-skills/
+USER node
+```
+
+Build it for `linux/amd64`, push it to a public registry, register it as a workspace template, and create instances from it.
+
+See [Custom agent image](/docs/agents-api/custom-image) for the step-by-step walkthrough, with a copy-able example — a `Dockerfile`, an example skill, a `register.sh`, and a tiny bring-your-own-model proxy.
+
+The contract:
+
+* Pin the base tag. `hermes-base` is published alongside the built-in `agent37-hermes` image with date tags; `latest` floats.
+* Keep the entrypoint. It starts Hermes and the gateway; a Dockerfile that overrides `ENTRYPOINT` loses the chat API.
+* Bake outside `/home/node` and `/home/linuxbrew`. Both are persistent volumes, so anything the image writes there is masked at runtime. Use `/usr/local` or `/opt`. Skills placed in `/usr/local/share/agent37/default-skills/` are copied into `~/.hermes/skills` at boot.
+* The image runs as the `node` user, with passwordless sudo. Switch to `USER root` for installs and back to `USER node` at the end.
+* Declare a default port and leave it to the gateway. The runtime binds the gateway to the template's default port, so the bare instance URL serves the chat API; do not bind your own service there. Declare your own services as additional ports. With no default port the instance is a private sandbox reachable only by [exec](/docs/agents-api/exec).
+* Bring your own model keys. Instances boot with no LLM provider configured, and chat returns errors until you add one. Write your provider credentials into `~/.hermes/config.yaml`, Hermes' standard config file, over [exec](/docs/agents-api/exec) or the terminal. The file lives on the persistent volume, so it survives restarts and updates.
+
+## Update a template
+
+`PATCH /v1/templates/{name}` changes any of `name`, `image_ref`, `description`, or `ports`. Send at least one field. Renaming onto an existing name returns `409 template_conflict`; system templates return `403`.
+
+```bash curl theme={null}
+curl -X PATCH https://api.agent37.com/v1/templates/my-agent \
+  -H "Authorization: Bearer sk_live_..." \
+  -H "Content-Type: application/json" \
+  -d '{ "image_ref": "ghcr.io/acme/my-agent:v2" }'
+```
+
+Point `image_ref` at an older tag to roll back. Existing instances keep running on the image they already pulled; [update each instance](/docs/agents-api/instances) to recreate it from the template's current `image_ref`.
+
+## Delete a template
+
+`DELETE /v1/templates/{name}` removes the workspace template and acts once: the first call returns `200` with `{ "name": "my-agent", "deleted": true }`, and a repeat returns `404`. System templates return `403`. Existing instances created from it keep running.
+
+```bash curl theme={null}
+curl -X DELETE https://api.agent37.com/v1/templates/my-agent \
+  -H "Authorization: Bearer sk_live_..."
+```
+
+## The template object
+
+```json response theme={null}
+{
+  "name": "agent37-hermes",
+  "scope": "system",
+  "agents": ["hermes"],
+  "image_ref": "ghcr.io/agent37-platform/hermes:2026.06.14",
+  "description": "Hermes general agent: browser, code, files.",
+  "ports": [
+    { "port": 3737, "default": true },
+    { "port": 9119, "default": false },
+    { "port": 7681, "default": false },
+    { "port": 8080, "default": false }
+  ],
+  "created": null,
+  "updated": null
+}
+```
+
+<ResponseField name="name" type="string">
+  The name you pass as `template` when creating an instance.
+</ResponseField>
+
+<ResponseField name="scope" type="string">
+  `system` for built-in `agent37-` templates, `workspace` for ones you register.
+</ResponseField>
+
+<ResponseField name="agents" type="string[]">
+  The agents the template installs: `["hermes"]` on `agent37-hermes`. Workspace templates report `[]` — the platform does not inspect what your image installs.
+</ResponseField>
+
+<ResponseField name="image_ref" type="string">
+  The image the platform pulls.
+</ResponseField>
+
+<ResponseField name="description" type="string | null">
+  Your optional description.
+</ResponseField>
+
+<ResponseField name="ports" type="array">
+  The declared ports, each `{ "port": <int>, "default": <bool> }`. Template ports carry no URL; URLs are minted per instance and returned in the instance object's `ports`. See [Instance and preview URLs](/docs/agents-api/urls).
+</ResponseField>
+
+<ResponseField name="created" type="integer | null">
+  Creation time in epoch seconds. `null` for system templates.
+</ResponseField>
+
+<ResponseField name="updated" type="integer | null">
+  Last update time in epoch seconds. `null` for system templates.
+</ResponseField>
+
+## Errors
+
+| Status | Code                | When                                                                                                  |
+| ------ | ------------------- | ----------------------------------------------------------------------------------------------------- |
+| `400`  | `invalid_request`   | Bad `name`, `image_ref`, or `ports`; a direct image reference passed as `template` on instance create |
+| `403`  | `forbidden`         | `PATCH` or `DELETE` on a system template: they are read-only                                          |
+| `404`  | `not_found`         | Unknown template name; repeat `DELETE`                                                                |
+| `409`  | `template_conflict` | Create or rename onto a name that already exists                                                      |
+
+See [Errors](/docs/agents-api/errors) for the envelope and the full catalog.
+
+
+# Instance and preview URLs
+Source: https://agent37.com/docs/agents-api/urls
+
+Reach the software running inside an instance over HTTPS, at instance and preview URLs you can derive from the instance id.
+
+Every instance with a default port is reachable at `https://{instanceId}.agent37.app`. The instance id is the DNS label, so instance `ab12cd34ef` lives at `https://ab12cd34ef.agent37.app`: you can construct the URL from the id alone, with no lookup step.
+
+<Info>
+  Instance URLs are the Agent API plane: you reach what runs *inside* an instance here, authenticated by the same `sk_live_` key as the hosting API. See [Core concepts](/docs/agents-api/concepts).
+</Info>
+
+## One URL per port
+
+A template declares which container ports an instance exposes, and every exposed port gets its own HTTPS URL in the instance object's `ports` array:
+
+```json instance ports theme={null}
+"ports": [
+  { "port": 3737, "default": true,  "url": "https://ab12cd34ef.agent37.app" },
+  { "port": 9119, "default": false, "url": "https://ab12cd34ef-9119.agent37.app" },
+  { "port": 7681, "default": false, "url": "https://ab12cd34ef-7681.agent37.app" },
+  { "port": 8080, "default": false, "url": "https://ab12cd34ef-8080.agent37.app" }
+]
+```
+
+The default port owns the bare **instance URL** (`https://{instanceId}.agent37.app`), where the agent's API lives. Every non-default port gets a **preview URL**, `https://{instanceId}-{port}.agent37.app` — also derivable from the instance id and the port number. Preview URLs serve your own services plus the agent's built-in dashboard, terminal, and file browser.
+
+<ResponseField name="port" type="integer">
+  The container port inside the instance.
+</ResponseField>
+
+<ResponseField name="default" type="boolean">
+  At most one port per template is the default. It is served at `https://{instanceId}.agent37.app`.
+</ResponseField>
+
+<ResponseField name="url" type="string">
+  The HTTPS URL that routes to this port — the instance URL for the default port, a preview URL otherwise. Add the Bearer to call it directly, or mint a signed URL to open it in a browser.
+</ResponseField>
+
+### What `agent37-hermes` exposes
+
+| Port   | URL                                        | Serves                                                                                                              |
+| ------ | ------------------------------------------ | ------------------------------------------------------------------------------------------------------------------- |
+| `3737` | `https://ab12cd34ef.agent37.app` (default) | The gateway: [chat](/docs/agents-api/chat) at `/v1/responses`, plus sessions, [files](/docs/agents-api/files), models, health |
+| `9119` | `https://ab12cd34ef-9119.agent37.app`      | Hermes dashboard (browser)                                                                                          |
+| `7681` | `https://ab12cd34ef-7681.agent37.app`      | A shell in the container (browser)                                                                                  |
+| `8080` | `https://ab12cd34ef-8080.agent37.app`      | File browser for the workspace (browser)                                                                            |
+
+So for the default [template](/docs/agents-api/templates), chat is just the bare URL plus a path: `POST https://ab12cd34ef.agent37.app/v1/responses`. The dashboard, terminal, and file browser live on preview URLs; mint a [signed URL](#browser-access-with-signed-urls) to open one in a browser.
+
+### What `agent37-openclaw` exposes
+
+| Port    | URL                                        | Serves                                                                                                              |
+| ------- | ------------------------------------------ | ------------------------------------------------------------------------------------------------------------------- |
+| `3737`  | `https://ab12cd34ef.agent37.app` (default) | The gateway: [chat](/docs/agents-api/chat) at `/v1/responses`, plus sessions, [files](/docs/agents-api/files), models, health |
+| `18789` | `https://ab12cd34ef-18789.agent37.app`     | OpenClaw dashboard, its Control UI (browser)                                                                        |
+| `7681`  | `https://ab12cd34ef-7681.agent37.app`      | A shell in the container (browser)                                                                                  |
+| `8080`  | `https://ab12cd34ef-8080.agent37.app`      | File browser for the workspace (browser)                                                                            |
+
+Same shape as Hermes: chat is the bare URL plus a path, and the dashboard, terminal, and file browser sit on preview URLs. The dashboard here is OpenClaw's own Control UI, served on `18789` instead of Hermes's `9119`.
+
+## Authentication
+
+A port accepts either credential, so you can reach the same port two ways:
+
+* **Bearer** for API calls.
+* **Signed URL** for handing a browser tab to a person.
+
+### Bearer (programmatic)
+
+Every request to an instance URL can carry the same workspace API key as the hosting API:
+
+```
+Authorization: Bearer sk_live_...
+```
+
+The platform edge authenticates the key, checks that the instance belongs to your workspace, and forwards the request to the instance's port. A request without a credential gets `401`; a key from another workspace gets `404`.
+
+The Bearer is a header. To open a preview URL like the dashboard, terminal, or file browser in a browser, mint a signed URL instead.
+
+### Browser access with signed URLs
+
+A signed URL is a time-boxed link a browser can open with no header, usually a preview URL. Mint one for any exposed port on the hosting API:
+
+<CodeGroup>
+  ```bash curl theme={null}
+  curl -X POST https://api.agent37.com/v1/instances/ab12cd34ef/signed-url \
+    -H "Authorization: Bearer sk_live_..." \
+    -H "Content-Type: application/json" \
+    -d '{ "port": 9119 }'
+  ```
+
+  ```python python theme={null}
+  import requests
+
+  r = requests.post(
+      "https://api.agent37.com/v1/instances/ab12cd34ef/signed-url",
+      headers={"Authorization": "Bearer sk_live_..."},
+      json={"port": 9119},
+  )
+  print(r.json()["url"])
+  ```
+
+  ```javascript node theme={null}
+  const res = await fetch("https://api.agent37.com/v1/instances/ab12cd34ef/signed-url", {
+    method: "POST",
+    headers: { Authorization: "Bearer sk_live_...", "Content-Type": "application/json" },
+    body: JSON.stringify({ port: 9119 }),
+  });
+  console.log((await res.json()).url);
+  ```
+
+  ```json response theme={null}
+  {
+    "url": "https://ab12cd34ef-9119.agent37.app/?a37_token=6a2b...e1f0",
+    "port": 9119,
+    "expires_at": 1717999200
+  }
+  ```
+</CodeGroup>
+
+<ResponseField name="url" type="string">
+  The browser-openable URL. The first request promotes the token to a short-lived cookie, so the page's own assets and WebSocket connections authenticate without it.
+</ResponseField>
+
+<ResponseField name="port" type="integer">
+  The port the URL routes to.
+</ResponseField>
+
+<ResponseField name="expires_at" type="integer">
+  Unix seconds when the URL stops working. Mint a fresh one when it expires.
+</ResponseField>
+
+The instance must be running, and `port` must be one it exposes (any port from the `ports` array, default or not). An optional `ttl_seconds` sets how long the URL lives, default `3600` (one hour), clamped to `[60, 86400]` (one minute to one day); pass a short value for a quick preview link or the max for a day-long share link. An unexposed or missing port, or a `ttl_seconds` that is not a positive integer, returns `400`; an unknown or cross-workspace instance returns `404`.
+
+The token rides in the `a37_token` query param. The edge consumes it (promoting it to the cookie) and strips it before forwarding, so it never reaches the instance and never collides with a query param your own app uses.
+
+For user-facing browser access, mint the signed URL on demand and hand the link to the browser. The link is the only credential it carries, and it expires.
+
+## Call an instance
+
+Hit the bare URL directly. The gateway's health endpoint is a quick reachability check:
+
+<CodeGroup>
+  ```bash curl theme={null}
+  curl https://ab12cd34ef.agent37.app/v1/health \
+    -H "Authorization: Bearer sk_live_..."
+  ```
+
+  ```python python theme={null}
+  import requests
+
+  r = requests.get(
+      "https://ab12cd34ef.agent37.app/v1/health",
+      headers={"Authorization": "Bearer sk_live_..."},
+  )
+  print(r.json())
+  ```
+
+  ```javascript node theme={null}
+  const res = await fetch("https://ab12cd34ef.agent37.app/v1/health", {
+    headers: { Authorization: "Bearer sk_live_..." },
+  });
+  console.log(await res.json());
+  ```
+
+  ```json response theme={null}
+  { "ok": true, "agent": "hermes", "healthy": true, "hermes": true }
+  ```
+</CodeGroup>
+
+<Note>
+  Use the gateway's `/v1/health` for this, not `/health`: the bare path `/health` is reserved by the platform edge, which answers `{ "ok": true }` itself — without authentication and without reaching your instance.
+</Note>
+
+## HTTP, SSE, and WebSocket
+
+Plain HTTP requests, SSE streams, and WebSocket connections all pass end to end. [Streaming chat](/docs/agents-api/streaming) with `stream: true` works on the bare URL, and the connection stays open until the server closes it after the terminal event. WebSocket upgrades pass through too: that is what the browser terminal uses for its interactive shell.
+
+## Templates with no ports
+
+A [template](/docs/agents-api/templates) that declares no ports produces a private sandbox: the instance runs, but nothing is routable and it has no URL at all (`ports` is empty). You can still drive it from the hosting API with [exec](/docs/agents-api/exec), which runs shell commands inside the instance without any exposed port.
+
+
+# White-label starter
+Source: https://agent37.com/docs/agents-api/white-label
+
+Fork a multi-tenant agent dashboard, point it at your API key, rebrand it, and ship — the fastest way to put Agent37 in front of your users.
+
+The white-label starter is a complete, multi-tenant dashboard for creating and managing agent [instances](/docs/agents-api/instances) on the Hosting API. Fork it, point it at your `sk_live_` key, change the name and logo, and deploy — you get a branded product on top of Agent37 without building the control plane yourself.
+
+<Card title="agent37-platform/whitelabel" icon="github" href="https://github.com/agent37-platform/whitelabel">
+  The dashboard, ready to fork. Next.js and Supabase, deploys to Vercel. Clone it, add your keys, run `npm run setup`, and rebrand.
+</Card>
+
+<Frame>
+  <img alt="The white-label dashboard" />
+</Frame>
+
+## What you get
+
+* **Multi-tenant from the start.** Workspaces, team members, and invitations, with row-level security in Postgres. Each agent is scoped to a workspace, and one user can belong to several.
+* **Full instance management.** Create, start, stop, restart, resize, roll to a new image, and delete instances — every [instance](/docs/agents-api/instances) action wrapped in a UI, with per-agent [budgets](/docs/agents-api/budgets) and usage.
+* **Each agent's own UIs, one click away.** The dashboard mints [signed URLs](/docs/agents-api/urls#browser-access-with-signed-urls) to open an instance's built-in Hermes chat, terminal, and file browser — it brokers the instance's native interfaces rather than reimplementing them.
+* **Auth and branding handled.** Email magic-link sign-in through Supabase, and the app name and logo are env-driven, so rebranding is config, not code.
+* **Your key stays server-side.** Every Agent37 call goes through the app's own backend; the `sk_live_` key is never exposed to the browser.
+
+## Get started
+
+<Steps>
+  <Step title="Get your keys">
+    You need a funded workspace and an `sk_live_` [API key](https://www.agent37.com/dashboard/cloud/api-keys), plus a Supabase access token — the starter provisions a free Supabase project for you. See [Billing](/docs/agents-api/billing) to fund the wallet.
+  </Step>
+
+  <Step title="Clone it">
+    ```bash theme={null}
+    git clone https://github.com/agent37-platform/whitelabel
+    cd whitelabel
+    ```
+  </Step>
+
+  <Step title="Run setup">
+    The fastest path is agent-driven: open the folder in Claude Code or Codex and paste the setup prompt from the README. It installs dependencies, asks for your keys, provisions Supabase, and starts the app.
+
+    To do it by hand, run `npm install`, then `npm run setup` and paste your two keys when prompted — it provisions Supabase and runs the migration.
+  </Step>
+
+  <Step title="Run it">
+    ```bash theme={null}
+    npm run dev
+    ```
+
+    Open `http://localhost:3000` and sign in with a magic link. The repo's `SETUP.md` has the authoritative steps and a manual Supabase path.
+  </Step>
+</Steps>
+
+## Make it yours
+
+Rebranding is the point, and most of it is configuration:
+
+* **Name and logo** — set `NEXT_PUBLIC_APP_NAME` and `NEXT_PUBLIC_LOGO_URL` (and the rest of the branding config) in your environment.
+* **Colors and theme** — Tailwind, in the app's styles.
+* **Your domain** — deploy to Vercel and point your domain at it.
+
+When you deploy, set `AGENT37_API_KEY` and the public Supabase variables, and keep the setup-only secrets (the Supabase access token and database password) out of production. The repo's `SETUP.md` lists exactly which variables to set where.
+
+## What it does and doesn't do
+
+The dashboard runs entirely on your Agent37 [wallet and budgets](/docs/agents-api/billing): it sets a managed-spend cap per agent and shows usage, but it does not bill your end users — add your own billing if you charge them. It also doesn't ship its own chat UI; chat is each instance's built-in Hermes interface, opened through a signed URL.
+
+<Note>
+  Want to build the experience yourself instead of forking a dashboard? See [Build a chat app](/docs/agents-api/chat-app) for the integration pattern, or [Custom agent image](/docs/agents-api/custom-image) to change what the agent can do.
+</Note>
+
+
+# Quickstart
+Source: https://agent37.com/docs/index
+
+Create an agent and stream its first reply in two API calls.
+
+Agent37 Cloud gives every user their own hosted agent computer. Create an instance and Hermes comes back running at its own URL: it chats, streams, browses, runs tools, and keeps state between conversations — files, connected accounts, and memory stay on the agent until you delete it. You create the agent with one call, then talk to it with the next; you never touch a server.
+
+<Note>
+  **Building with an AI coding agent?** Point it at **[llms-full.txt](https://www.agent37.com/docs/llms-full.txt)** — the entire API in one file — and it can scaffold a working client.
+</Note>
+
+**Three ways to build on Agent37:**
+
+<CardGroup>
+  <Card title="White-label starter" icon="rocket" href="/agents-api/white-label">
+    Fork a multi-tenant dashboard, rebrand it, and deploy. The fastest way to ship.
+  </Card>
+
+  <Card title="Build a chat app" icon="message" href="/agents-api/chat-app">
+    Wire the two API planes into your own app. Where most teams start.
+  </Card>
+
+  <Card title="Custom agent image" icon="package" href="/agents-api/custom-image">
+    Bring your own tools, skills, or model.
+  </Card>
+</CardGroup>
+
+The rest of this page is the API itself — create an instance and stream a reply in two calls.
+
+<img alt="Agent37 Cloud routes requests from your app to isolated agent instances." />
+
+<Steps>
+  <Step title="Get a key">
+    Mint an API key at [www.agent37.com/dashboard/cloud/api-keys](https://www.agent37.com/dashboard/cloud/api-keys). The full `sk_live_...` key is shown once, at creation. Send it as a Bearer token on every request.
+
+    New workspaces include enough credit to create one instance. Add funds from [billing](https://www.agent37.com/dashboard/cloud/billing) before you run more than one instance. [Billing](/docs/agents-api/billing) covers pricing, fleet balance, and top-up rules.
+  </Step>
+
+  <Step title="Create an instance">
+    `POST /v1/instances` provisions a computer running the default `agent37-hermes` template and returns `201` once its `status` is `running`. Every field is optional, but include managed-spend headroom if you want built-in LLM calls to work from the first message.
+
+    <CodeGroup>
+      ```bash curl theme={null}
+      curl -X POST https://api.agent37.com/v1/instances \
+        -H "Authorization: Bearer sk_live_..." \
+        -H "Content-Type: application/json" \
+        -d '{ "budget": { "credit_micros": 1000000 } }'
+      ```
+
+      ```python python theme={null}
+      import requests
+
+      H = {"Authorization": "Bearer sk_live_..."}
+      inst = requests.post(
+          "https://api.agent37.com/v1/instances",
+          headers=H,
+          json={"budget": {"credit_micros": 1_000_000}},
+      ).json()
+      ```
+
+      ```javascript node theme={null}
+      const H = { Authorization: "Bearer sk_live_..." };
+      const inst = await (await fetch("https://api.agent37.com/v1/instances", {
+        method: "POST",
+        headers: { ...H, "Content-Type": "application/json" },
+        body: JSON.stringify({ budget: { credit_micros: 1_000_000 } }),
+      })).json();
+      ```
+
+      ```json response theme={null}
+      {
+        "id": "ab12cd34ef",
+        "status": "running",
+        "template": "agent37-hermes",
+        "image_ref": "ghcr.io/agent37-platform/hermes:2026.06.09",
+        "resources": { "cpu": 2, "memory": 4, "disk": 6 },
+        "ports": [
+          { "port": 3737, "default": true, "url": "https://ab12cd34ef.agent37.app" },
+          { "port": 9119, "default": false, "url": "https://ab12cd34ef-9119.agent37.app" },
+          { "port": 7681, "default": false, "url": "https://ab12cd34ef-7681.agent37.app" },
+          { "port": 8080, "default": false, "url": "https://ab12cd34ef-8080.agent37.app" }
+        ],
+        "user": null,
+        "name": null,
+        "metadata": null,
+        "paid_through": 1783641600,
+        "past_due": false,
+        "created": 1781049600
+      }
+      ```
+    </CodeGroup>
+
+    The default port's `url` is the instance's own API: the instance id is the DNS label, so `ab12cd34ef` answers at `https://ab12cd34ef.agent37.app`. That is the address you talk to next. The other ports are preview URLs for the agent's dashboard, terminal, and files — see [Instance and preview URLs](/docs/agents-api/urls).
+  </Step>
+
+  <Step title="Send it a streamed message">
+    `POST /v1/responses` on the instance URL runs a turn. Set `stream: true` to receive Server-Sent Events as the agent reasons, calls tools, and writes its answer. Same `sk_live_` key.
+
+    <CodeGroup>
+      ```bash curl theme={null}
+      curl -N https://ab12cd34ef.agent37.app/v1/responses \
+        -H "Authorization: Bearer sk_live_..." \
+        -H "Content-Type: application/json" \
+        -d '{
+          "input": "Research the top 3 EV makers, write a memo.",
+          "stream": true
+        }'
+      ```
+
+      ```python python theme={null}
+      r = requests.post(
+          "https://ab12cd34ef.agent37.app/v1/responses",
+          headers=H,
+          stream=True,
+          json={
+              "input": "Research the top 3 EV makers, write a memo.",
+              "stream": True,
+          },
+      )
+      for line in r.iter_lines():
+          print(line.decode())
+      ```
+
+      ```javascript node theme={null}
+      const res = await fetch("https://ab12cd34ef.agent37.app/v1/responses", {
+        method: "POST",
+        headers: { ...H, "Content-Type": "application/json" },
+        body: JSON.stringify({
+          input: "Research the top 3 EV makers, write a memo.",
+          stream: true,
+        }),
+      });
+      // res.body is an SSE stream of named events
+      ```
+    </CodeGroup>
+
+    The stream opens with `response.created`, which carries the ids you need, and ends with a terminal event after which the server closes the connection:
+
+    ```text events theme={null}
+    event: response.created
+    data: {"id":"c91d2a7e84f04b6f9a3d5e1c0b87f4a2","session_id":"7f3e0b6c52a949d2b1c4a8e9d0f31726"}
+
+    event: response.output_text.delta
+    data: {"text":"Here is the memo. Tesla still leads on"}
+
+    event: response.completed
+    data: {"output_text":"Here is the memo...","usage":{"input_tokens":1840,"output_tokens":920,"cost_usd":0.0137}}
+    ```
+
+    <Tip>
+      Prefer not to stream? Leave `stream` off (the default is `false`) and the call returns the finished response as one JSON body.
+    </Tip>
+  </Step>
+
+  <Step title="Continue the conversation">
+    Reuse the `session_id` to continue the same thread. The agent keeps the full history on the instance, so you send only the new input.
+
+    ```bash curl theme={null}
+    curl https://ab12cd34ef.agent37.app/v1/responses \
+      -H "Authorization: Bearer sk_live_..." \
+      -H "Content-Type: application/json" \
+      -d '{
+        "session_id": "7f3e0b6c52a949d2b1c4a8e9d0f31726",
+        "input": "Make it shorter, add a quote."
+      }'
+    ```
+  </Step>
+</Steps>
+
+<Note>
+  Done experimenting? `DELETE /v1/instances/{id}` refunds the unused remainder of the month to your wallet, prorated to the exact time used. See [Billing](/docs/agents-api/billing).
+</Note>
+
+<Note>
+  Looking for **OpenClaw** channel, model, or networking setup? Start at the [OpenClaw overview](/docs/openclaw/overview).
+</Note>
+
+
