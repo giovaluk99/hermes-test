@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# a37 — tiny Agent37 exec wrapper. "Shell in" to an instance, one line at a time.
+#
+#   ./a37 exec '<shell command>'   run a command in the instance (default action)
+#   ./a37 '<shell command>'        shorthand for exec
+#   ./a37 info                     instance object (status, urls, billing)
+#   ./a37 repl                     pseudo-shell: type commands, each is one exec call
+#
+# Config (env): AGENT37_KEY (required), AGENT37_INSTANCE (required), AGENT37_API.
+# ponytail: each exec is stateless (fresh sh -c) — no cd/env persistence. That's
+# the platform's model, not a bug. Chain with '&&' inside one command if you need state.
+set -euo pipefail
+
+API="${AGENT37_API:-https://api.agent37.com/v1}"
+KEY="${AGENT37_KEY:-${AGENT37_GIO_TEST:-}}"
+INST="${AGENT37_INSTANCE:-ym8dpjcfhi}"
+
+[ -n "$KEY" ]  || { echo "set AGENT37_KEY (or AGENT37_GIO_TEST)" >&2; exit 2; }
+[ -n "$INST" ] || { echo "set AGENT37_INSTANCE" >&2; exit 2; }
+
+exec_cmd() {
+  local cmd="$1"
+  # jq builds the JSON body so quoting/escaping is correct for any command.
+  jq -nc --arg c "$cmd" '{command:$c}' \
+    | curl -sS -X POST "$API/instances/$INST/exec" \
+        -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" -d @- \
+    | jq -r 'if .stdout != "" then .stdout else "" end,
+             (if .stderr != "" then "\u001b[31m"+.stderr+"\u001b[0m" else empty end),
+             (if .exit_code != 0 then "[exit \(.exit_code)]" else empty end)'
+}
+
+case "${1:-}" in
+  ""|-h|--help) sed -n '2,12p' "$0"; exit 0 ;;
+  info)  curl -sS "$API/instances/$INST" -H "Authorization: Bearer $KEY" | jq . ;;
+  repl)  echo "a37 repl on $INST — Ctrl-D to quit (each line = one stateless exec)"
+         while IFS= read -r -p "a37> " line; do [ -n "$line" ] && exec_cmd "$line"; done ;;
+  exec)  shift; exec_cmd "$*" ;;
+  *)     exec_cmd "$*" ;;
+esac
