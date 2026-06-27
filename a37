@@ -4,6 +4,7 @@
 #   ./a37 exec '<shell command>'   run a command in the instance (default action)
 #   ./a37 '<shell command>'        shorthand for exec
 #   ./a37 info                     instance object (status, urls, billing)
+#   ./a37 chat '<message>'         talk to the Hermes agent (keeps the conversation going)
 #   ./a37 repl                     pseudo-shell: type commands, each is one exec call
 #
 # Config (env): AGENT37_KEY (required), AGENT37_INSTANCE (required), AGENT37_API.
@@ -29,9 +30,17 @@ exec_cmd() {
              (if .exit_code != 0 then "[exit \(.exit_code)]" else empty end)'
 }
 
+APP_DOMAIN="${AGENT37_APP_DOMAIN:-agent37.app}"
 case "${1:-}" in
   ""|-h|--help) sed -n '2,12p' "$0"; exit 0 ;;
   info)  curl -sS "$API/instances/$INST" -H "Authorization: Bearer $KEY" | jq . ;;
+  chat)  shift   # talk to the Hermes agent; keeps the conversation in .a37-session.<id>
+         SF=".a37-session.$INST"; SID=$([ -f "$SF" ] && cat "$SF" || echo "")
+         BODY=$(jq -nc --arg i "$*" --arg s "$SID" '{input:$i} + (if $s=="" then {} else {session_id:$s} end)')
+         R=$(curl -sS -X POST "https://$INST.$APP_DOMAIN/v1/responses" \
+               -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" -d "$BODY")
+         echo "$R" | jq -r '.session_id // empty' > "$SF"
+         echo "$R" | jq -r '.output_text // (.error|tostring)' ;;
   repl)  echo "a37 repl on $INST — Ctrl-D to quit (each line = one stateless exec)"
          while IFS= read -r -p "a37> " line; do [ -n "$line" ] && exec_cmd "$line"; done ;;
   exec)  shift; exec_cmd "$*" ;;

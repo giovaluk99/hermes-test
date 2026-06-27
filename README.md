@@ -35,3 +35,15 @@ export AGENT37_KEY=sk_live_...        # or rely on AGENT37_GIO_TEST
 Sources stitched (there's no logs endpoint): runtime log files via the Files
 endpoint, file discovery via `exec`, conversation history via `/v1/sessions`.
 See [docs/under-the-hood.md](docs/under-the-hood.md#7-logs--observability).
+
+## Chatting with the Hermes agent
+
+`./a37 chat '<message>'` talks to the agent on the instance (Agent API,
+`POST /v1/responses`) and keeps the conversation in `.a37-session.<id>` (git-ignored).
+Google Calendar is connected (as `tenderwright@gmail.com` via Composio OAuth), so you
+can ask it to schedule meetings:
+
+```bash
+./a37 chat "Schedule a 30-min meeting with andi@example.com and sally@example.com
+            Tuesday 2pm PT titled 'Sync', add a Google Meet link and invite them."
+```
