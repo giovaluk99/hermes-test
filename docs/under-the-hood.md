@@ -211,6 +211,46 @@ For large/growing logs, switch the whole-file pull to an incremental byte-offset
 tail (`exec 'tail -c +$N file'`, track `$N` locally). For a real pipeline, point
 the pull at your log store (Loki/CloudWatch/S3) instead of local files.
 
+## 8. Meeting recording (no Docker) — tested
+
+**Goal:** record meetings. **`docker compose up` does not work** (no Docker, no
+root, cgroup read-only, no `/dev/kvm`, no `newuidmap` — gVisor blocks nested
+containerization), so Attendee-as-shipped (compose + container-per-bot) can't run.
+But the *recorder core* runs **natively in userspace**, and was tested end to end:
+
+| Piece | How | Result |
+|-------|-----|--------|
+| Virtual display | `Xvfb :100` (separate from the agent's `:99`) | ✅ |
+| Browser in a meeting | `chromium` headful + `--use-fake-{ui,device}-for-media-stream` (synthetic cam/mic) | ✅ joined a real Jitsi conference on `meet.ffmuc.net` ([img](img/jitsi-bot-joined.png)) |
+| Video capture | `ffmpeg -f x11grab` → h264 mp4 | ✅ valid 1280×720 mp4 |
+| Audio capture | `pulseaudio` (brew, userspace) `module-null-sink` + `ffmpeg -f pulse -i rec.monitor` | ✅ AAC stereo, mean −13.5 dB (not silence) |
+| Muxed A/V | one `ffmpeg` with both inputs | ✅ single mp4, video **and** audio streams ([frame](img/recorded-av-frame.png)) |
+
+Scripts: [`recorder/record_meeting.sh`](../recorder/record_meeting.sh) (browser
+joins a Jitsi room, records video) and
+[`recorder/record_av.sh`](../recorder/record_av.sh) (proves combined audio+video
+capture via the PulseAudio null sink). No hardware audio exists (`/dev/snd`
+absent) — the null sink is the standard container trick, exactly what Attendee's
+bots use.
+
+**Caveats found:**
+- `meet.jit.si` now gates the first participant behind moderator **login** —
+  anonymous bots get "waiting for a moderator." Use an open Jitsi (e.g. ffmuc),
+  8x8 JaaS with a key, or a real Zoom/Meet/Teams link the bot is admitted to.
+- ffmuc pops a "what's your name?" modal (displayName hash param ignored) — needs
+  a keystroke (`xdotool type … key Return`) or CDP to dismiss for a fully
+  unattended join.
+- Datacenter egress (OVH) → meeting platforms may flag the bot; route through a
+  residential proxy if needed (§5b).
+- A 2 vCPU / 4 GB shape handles **one** bot + Chromium + ffmpeg; size up per bot.
+- Long recordings: run the recorder as a background process and keep it alive
+  via `post-restart.sh` (§7); each `exec` is stateless.
+
+**Verdict:** good for a **single native meeting-recorder bot** per instance. Not
+for Attendee's Docker/multi-bot deployment — for that, use a real VM/host with
+Docker. The pipeline (Xvfb + Chromium + PulseAudio null sink + ffmpeg) is the
+same one every containerized recorder uses; here it just runs without the container.
+
 ---
 
 ### Reproduce
