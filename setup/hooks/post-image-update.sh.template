@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Runs when the runtime image changes (for example after an instance update).
+# Use this to reinstall tools that are not persisted in /home/node or /home/linuxbrew.
+
+# Fix Hermes' broken Anthropic OAuth initial-exchange endpoint (console.anthropic.com 404s).
+sed -i 's#_OAUTH_TOKEN_URL = "https://console.anthropic.com/v1/oauth/token"#_OAUTH_TOKEN_URL = "https://platform.claude.com/v1/oauth/token"#' /usr/local/lib/hermes/hermes-agent/agent/anthropic_adapter.py 2>/dev/null || true
+
+# Re-apply OAuth system-prompt relocation (lib is on the ephemeral overlay)
+# re-apply all persisted lib patches (lib is on the ephemeral overlay)
+for p in /home/node/.agent37/patches/*.py; do [ -f "$p" ] && /usr/local/lib/hermes/hermes-agent/venv/bin/python "$p" >/dev/null 2>&1 || true; done

@@ -1,6 +1,18 @@
 # hermes-test
 
-Scratch repo for testing [Hermes](https://www.agent37.com/) on Agent 37.
+Working repo for running [Hermes](https://www.agent37.com/) on Agent37 — including
+our full **Claude Max subscription (OAuth)** setup, Slack channel, lib patches, and
+the hard-won gotchas.
+
+## ▶ Replicating the whole setup
+See **[`setup/SETUP.md`](setup/SETUP.md)** for the end-to-end guide (instance, Slack,
+subscription, patches, skill) and **[`setup/GOTCHAS.md`](setup/GOTCHAS.md)** for the
+why behind each step. Secrets are templated as `<<PLACEHOLDERS>>` — never commit
+filled-in copies. `setup/` artifacts:
+- `patches/` — lib patches (keep OAuth in the plan lane; fix Slack `!command` args)
+- `hooks/` — boot hooks that re-assert the subscription + re-apply patches
+- `config.yaml.template`, `skills/slack-integration.SKILL.md`
+- `../hermes-sub` — one-command subscription enable/status toggle
 
 ## Try it
 Ask Hermes to:

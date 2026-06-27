@@ -3,3 +3,11 @@
 # pulled instance logs (runtime artifacts, may contain secrets)
 logs/
 .a37-session.*
+
+# never commit FILLED-IN secrets — only the *.template / sanitized versions
+.env
+*.env
+setup/config.yaml
+setup/hooks/post-restart.sh
+setup/hooks/post-image-update.sh
+setup/**/*.secret
