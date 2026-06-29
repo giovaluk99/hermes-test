@@ -11,3 +11,6 @@ setup/config.yaml
 setup/hooks/post-restart.sh
 setup/hooks/post-image-update.sh
 setup/**/*.secret
+
+# instance snapshots (contain secrets) — never commit
+exports/
